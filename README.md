@@ -149,6 +149,14 @@ MAX_DAILY_TRADES = 50                       # Stop after 50 trades/day
 
 4. **Backtesting**: Includes Binance fees (0.04%), slippage (0.03%), and spread (0.01%)
 
+### Optimization Hardware Requirements
+
+**Recommended**: Google Colab Pro with v5e-1 TPU runtime (96 cores, 300+ GB RAM) for fast optimization
+
+**Alternative**: Any system with 8+ CPU cores and 16GB+ RAM (will take longer)
+
+The optimization uses parallel processing - more cores = faster results. On Colab Pro with TPU runtime, each coin optimizes in ~2 hours. On a regular 4-core laptop, expect 8-12 hours per coin.
+
 ### Signal Generation
 
 ```python
@@ -216,6 +224,8 @@ docker run -d trading-bot
 ### Run optimization
 ```bash
 python optimization.py
+# Note: Use Google Colab Pro with v5e-1 TPU for best performance
+# Or run on a system with 8+ CPU cores
 ```
 
 ### Testnet trading
