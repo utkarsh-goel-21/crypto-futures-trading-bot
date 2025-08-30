@@ -27,7 +27,7 @@ The bot has been backtested on historical data with the following results:
 | LINKUSDT | 58.9% | 1.88 | -13.9% | +1.2% |
 | BCHUSDT | 54.2% | 1.59 | -17.4% | +0.8% |
 
-*Results based on 6-month backtest with $100 margin per trade at 10x leverage*
+*Results based on backtesting through August 2025 with $100 margin per trade at 10x leverage*
 
 ## Installation
 
