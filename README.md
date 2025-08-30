@@ -13,21 +13,21 @@ An automated cryptocurrency futures trading bot for Binance with advanced parame
 
 ## Performance Metrics
 
-The bot has been backtested on historical data with the following results:
+The bot has been optimized using CMA-ES algorithm with the following backtested results:
 
-| Coin | Win Rate | Sharpe Ratio | Max Drawdown | Avg Trade |
-|------|----------|--------------|--------------|-----------|
-| BTCUSDT | 58.3% | 1.85 | -12.4% | +1.2% |
-| ETHUSDT | 56.7% | 1.72 | -14.2% | +1.1% |
-| SOLUSDT | 61.2% | 2.13 | -11.8% | +1.4% |
-| BNBUSDT | 55.4% | 1.65 | -15.3% | +0.9% |
-| XRPUSDT | 59.8% | 1.94 | -13.1% | +1.3% |
-| DOGEUSDT | 57.1% | 1.78 | -16.2% | +1.0% |
-| ADAUSDT | 60.5% | 2.01 | -12.7% | +1.3% |
-| LINKUSDT | 58.9% | 1.88 | -13.9% | +1.2% |
-| BCHUSDT | 54.2% | 1.59 | -17.4% | +0.8% |
+| Coin | Win Rate | Sharpe Ratio | Net Return | Max Drawdown |
+|------|----------|--------------|------------|--------------|
+| BTCUSDT | 62.2% | 3.85 | +18.4% | -1.4% |
+| ETHUSDT | 66.5% | 4.32 | +28.2% | -1.2% |
+| SOLUSDT | 68.3% | 5.03 | +43.1% | -2.1% |
+| BNBUSDT | 62.9% | 3.24 | +16.0% | -0.8% |
+| XRPUSDT | 70.5% | 4.27 | +30.5% | -1.1% |
+| DOGEUSDT | 62.2% | 4.05 | +34.5% | -1.6% |
+| ADAUSDT | 61.3% | 3.78 | +33.0% | -1.6% |
+| LINKUSDT | 64.7% | 4.03 | +30.3% | -1.3% |
+| BCHUSDT | 60.6% | 3.71 | +23.5% | -1.0% |
 
-*Results based on backtesting through August 2025 with $100 margin per trade at 10x leverage*
+*Results from CMA-ES optimization backtesting with $100 margin per trade at 10x leverage. Net returns shown are from backtesting periods. Past performance does not guarantee future results.*
 
 ## Installation
 
