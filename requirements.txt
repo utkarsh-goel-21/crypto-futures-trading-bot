@@ -1,0 +1,11 @@
+ccxt>=4.0.0
+pandas>=2.0.0
+numpy>=1.24.0
+ta>=0.10.2
+python-binance>=1.0.17
+requests>=2.31.0
+python-telegram-bot>=20.0
+discord-webhook>=1.3.0
+cma>=3.3.0
+scipy>=1.10.0
+matplotlib>=3.7.0

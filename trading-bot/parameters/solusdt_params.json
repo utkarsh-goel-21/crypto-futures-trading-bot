@@ -1,0 +1,240 @@
+{
+  "parameters": {
+    "tp_percent": 0.04271209670617685,
+    "sl_percent": 0.039925142922276245,
+    "trailing_activation": 0.29413420372697524,
+    "trailing_distance": 0.0017178249521967353,
+    "use_trailing": 3.5815649349825404e-05,
+    "entry_threshold": 1.9649354920901823,
+    "rsi_weight": 0.18882828198238927,
+    "trend_ema_weight": 0.15089444581998668,
+    "price_ema_weight": 8.073910537038246e-05,
+    "macd_weight": 0.9019816090646275,
+    "volume_spike_weight": 0.895308428643817,
+    "bollinger_weight": 0.18562274444789284,
+    "stochastic_weight": 0.9823923946414821,
+    "atr_weight": 0.0037904758077774445,
+    "adx_weight": 0.006560324262315177,
+    "sr_weight": 0.9997402863840682,
+    "momentum_weight": 0.9924444081798764,
+    "market_structure_weight": 0.5998013504389331,
+    "time_filter_weight": 0.008443434482462804,
+    "mtf_confirmation_weight": 0.9705018200775062,
+    "rsi_period": 30,
+    "rsi_oversold": 18,
+    "rsi_overbought": 76,
+    "trend_fast_ema": 5,
+    "trend_slow_ema": 20,
+    "entry_ema_period": 7,
+    "macd_flip_only": 0.9664138289320572,
+    "macd_fast": 17,
+    "macd_slow": 20,
+    "macd_signal": 8,
+    "macd_histogram_threshold": 0.0006443571136991509,
+    "volume_ma_period": 23,
+    "volume_spike_multiplier": 1.2002692766826553,
+    "bollinger_period": 25,
+    "bollinger_std": 1.9152911289487988,
+    "bollinger_squeeze_enabled": 0.2998129765509377,
+    "bollinger_squeeze_length": 9,
+    "stochastic_k": 13,
+    "stochastic_d": 7,
+    "stochastic_overbought": 87,
+    "stochastic_oversold": 29,
+    "atr_period": 14,
+    "atr_min_threshold": 0.004229822869797835,
+    "atr_stop_multiplier": 2.4030665989885733,
+    "adx_period": 21,
+    "adx_threshold": 29,
+    "sr_lookback": 83,
+    "sr_touch_distance": 0.0017725448823922504,
+    "momentum_period": 18,
+    "momentum_threshold": 0.007370098951600509,
+    "structure_lookback": 13,
+    "max_daily_trades": 31,
+    "max_consecutive_losses": 3,
+    "daily_loss_limit": 0.050653276083916676,
+    "trade_start_hour": 1,
+    "trade_end_hour": 21,
+    "timeframe_combo": 0
+  },
+  "metrics": {
+    "total_trades": 271,
+    "win_rate": 68.26568265682657,
+    "sharpe_ratio": 5.02814451067354,
+    "total_return": 43.05229999928854,
+    "max_drawdown": -2.1237486448021743,
+    "profit_factor": 2.18555862469235,
+    "avg_win": 4.290066809767657,
+    "avg_loss": 4.222550695513064,
+    "profit_per_trade": 1.5886457564313115,
+    "monthly_consistency": 84.61538461538461,
+    "monthly_returns": [
+      2.970001519571036,
+      3.931627687293953,
+      -1.2546100198296657,
+      3.9539384333647685,
+      3.0377783968309746,
+      -1.1477210934328974,
+      12.116217826543824,
+      1.3826513383529229,
+      6.666806881740052,
+      2.697696836157324,
+      3.861841504393784,
+      4.008198388939136,
+      0.8278722993640748
+    ],
+    "filter_usage": {
+      "trend_ema": {
+        "count": 271,
+        "wins": 185,
+        "total_contribution": 40.892394817216314
+      },
+      "volume_spike": {
+        "count": 123,
+        "wins": 83,
+        "total_contribution": 55.06146836159467
+      },
+      "stochastic": {
+        "count": 11,
+        "wins": 9,
+        "total_contribution": 10.806316341056306
+      },
+      "market_structure": {
+        "count": 254,
+        "wins": 172,
+        "total_contribution": 121.87963440919142
+      },
+      "bollinger": {
+        "count": 79,
+        "wins": 52,
+        "total_contribution": 11.731357449106838
+      },
+      "momentum": {
+        "count": 256,
+        "wins": 174,
+        "total_contribution": 236.6656917429411
+      },
+      "mtf_confirmation": {
+        "count": 266,
+        "wins": 180,
+        "total_contribution": 154.8920904843699
+      },
+      "macd": {
+        "count": 37,
+        "wins": 23,
+        "total_contribution": 33.37331953539122
+      },
+      "rsi": {
+        "count": 41,
+        "wins": 28,
+        "total_contribution": 4.154222203612566
+      },
+      "sr": {
+        "count": 9,
+        "wins": 4,
+        "total_contribution": 6.298363804219628
+      }
+    },
+    "total_slippage": 73.07825035018072,
+    "total_spread": 2.710000000000001,
+    "failed_trades": 4
+  },
+  "score": 0.7639932280412881,
+  "active_filters": [
+    {
+      "name": "RSI",
+      "weight": 0.18882828198238927,
+      "importance": "Low"
+    },
+    {
+      "name": "TREND_EMA",
+      "weight": 0.15089444581998668,
+      "importance": "Low"
+    },
+    {
+      "name": "MACD",
+      "weight": 0.9019816090646275,
+      "importance": "High"
+    },
+    {
+      "name": "VOLUME_SPIKE",
+      "weight": 0.895308428643817,
+      "importance": "High"
+    },
+    {
+      "name": "BOLLINGER",
+      "weight": 0.18562274444789284,
+      "importance": "Low"
+    },
+    {
+      "name": "STOCHASTIC",
+      "weight": 0.9823923946414821,
+      "importance": "High"
+    },
+    {
+      "name": "SR",
+      "weight": 0.9997402863840682,
+      "importance": "High"
+    },
+    {
+      "name": "MOMENTUM",
+      "weight": 0.9924444081798764,
+      "importance": "High"
+    },
+    {
+      "name": "MARKET_STRUCTURE",
+      "weight": 0.5998013504389331,
+      "importance": "Medium"
+    },
+    {
+      "name": "MTF_CONFIRMATION",
+      "weight": 0.9705018200775062,
+      "importance": "High"
+    }
+  ],
+  "filter_summary": {
+    "High": [
+      "MACD (0.90)",
+      "VOLUME_SPIKE (0.90)",
+      "STOCHASTIC (0.98)",
+      "SR (1.00)",
+      "MOMENTUM (0.99)",
+      "MTF_CONFIRMATION (0.97)"
+    ],
+    "Medium": [
+      "MARKET_STRUCTURE (0.60)"
+    ],
+    "Low": [
+      "RSI (0.19)",
+      "TREND_EMA (0.15)",
+      "BOLLINGER (0.19)"
+    ],
+    "Negligible": [
+      "PRICE_EMA (0.00)",
+      "ATR (0.00)",
+      "ADX (0.01)",
+      "TIME_FILTER (0.01)"
+    ]
+  },
+  "timeframe": {
+    "entry": "5min",
+    "trend": "15min"
+  },
+  "entry_threshold": 1.9649354920901823,
+  "optimization_time_hours": 2.4199882125854493,
+  "total_evaluations": 127182,
+  "stop_reason": "early_stopping",
+  "realistic_testing_info": {
+    "slippage_percent": 0.03,
+    "spread_cost_percent": 0.01,
+    "trade_failure_rate_percent": 1.5,
+    "note": "Results include realistic execution costs"
+  },
+  "optimization_info": {
+    "talib_used": true,
+    "numba_used": true,
+    "itertuples_used": true,
+    "expected_speedup": "20-40x"
+  }
+}
