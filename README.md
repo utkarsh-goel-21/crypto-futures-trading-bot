@@ -156,9 +156,19 @@ The optimization maximizes Sharpe ratio while maintaining reasonable win rates a
 
 ## Disclaimer
 
+**⚠️ IMPORTANT: EDUCATIONAL PURPOSE ONLY**
+
+This software is provided for **EDUCATIONAL AND INFORMATIONAL PURPOSES ONLY**. It is NOT financial advice or a recommendation to trade.
+
 **USE AT YOUR OWN RISK**
 
-This bot is for educational purposes. Cryptocurrency trading involves substantial risk of loss. Past performance does not guarantee future results. Always test thoroughly on testnet before using real funds.
+- The author(s) bear **NO RESPONSIBILITY** for any losses incurred through use of this software
+- Cryptocurrency trading involves **SUBSTANTIAL RISK OF LOSS**
+- You may lose **ALL of your investment**
+- Past performance does **NOT** guarantee future results
+- Always test thoroughly on testnet before using real funds
+- Never invest money you cannot afford to lose
+- By using this software, you accept **FULL RESPONSIBILITY** for all trading decisions and outcomes
 
 ## Contributing
 
