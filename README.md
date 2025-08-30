@@ -155,7 +155,7 @@ MAX_DAILY_TRADES = 50                       # Stop after 50 trades/day
 
 **Alternative**: Any system with 8+ CPU cores and 16GB+ RAM (will take longer)
 
-The optimization uses parallel processing - more cores = faster results. On Colab Pro with TPU runtime, each coin optimizes in ~2 hours. On a regular 4-core laptop, expect 8-12 hours per coin.
+The optimization uses parallel processing - more cores = faster results. On Colab Pro with TPU runtime, each coin optimizes in 5-6 hours. On a regular 4-core laptop, expect 18-22 hours per coin.
 
 ### Signal Generation
 
