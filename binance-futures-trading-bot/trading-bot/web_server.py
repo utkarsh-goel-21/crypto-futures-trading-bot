@@ -3,26 +3,36 @@ Web server for trading bot monitoring
 Provides API endpoints and serves frontend
 """
 
-from flask import Flask, jsonify, render_template_string, send_from_directory
-from flask_cors import CORS
-import json
-import sqlite3
 import os
-import threading
-import time
-from datetime import datetime, timedelta
-from collections import deque
+import sqlite3
 import subprocess
 import sys
+import threading
+import time
+from collections import deque
+from datetime import datetime
+from pathlib import Path
 
-from flask import Flask, jsonify, render_template_string, send_from_directory, request
+from flask import Flask, jsonify, render_template_string, request
+from flask_cors import CORS
 from copy_trader import (
     list_followers, add_follower, toggle_follower, delete_follower
 )
 
 
 # Import bot configuration
+APP_ROOT = next(
+    (parent for parent in Path(__file__).resolve().parents if (parent / "spy_integration.py").exists()),
+    None
+)
+if APP_ROOT is None:
+    raise RuntimeError("Could not locate application root for SPY regime integration.")
+if str(APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(APP_ROOT))
+
+from config import DATABASE_FILE, LOG_FILE
 from environment import USE_TESTNET
+from spy_integration import SpyRegimeFilter
 
 if USE_TESTNET:
     from apikey_testnet import testnet_api_key as api_key, testnet_secret_key as secret_key
@@ -35,6 +45,11 @@ from binance.exceptions import BinanceAPIException
 app = Flask(__name__)
 CORS(app)
 
+BOT_DIR = Path(__file__).resolve().parent
+DATABASE_PATH = BOT_DIR / DATABASE_FILE
+LOG_PATH = BOT_DIR / LOG_FILE
+ENVIRONMENT_LABEL = "TESTNET" if USE_TESTNET else "MAINNET"
+
 # Global variables for storing bot data
 bot_data = {
     'balance': 0,
@@ -46,12 +61,17 @@ bot_data = {
     'pnl': 0,
     'status': 'Starting...',
     'logs': deque(maxlen=100),  # Keep last 100 log lines
-    'last_update': None
+    'last_update': None,
+    'environment': ENVIRONMENT_LABEL,
+    'spy_regime': None,
+    'spy_regime_error': None,
 }
 
 # Binance client
 client = None
 bot_process = None
+spy_regime_filter = SpyRegimeFilter(APP_ROOT)
+log_file_offset = 0
 
 def init_binance_client():
     """Initialize Binance client"""
@@ -103,30 +123,46 @@ def update_trade_stats():
     """Update trade statistics from database"""
     global bot_data
     try:
-        # Check if database exists
-        db_file = 'trades.db'
-        if os.path.exists(db_file):
-            conn = sqlite3.connect(db_file)
+        if DATABASE_PATH.exists():
+            conn = sqlite3.connect(DATABASE_PATH)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(trades)")
+            columns = {row[1] for row in cursor.fetchall()}
 
-            # Get total trades
-            cursor.execute("SELECT COUNT(*) FROM trades WHERE exit_time IS NOT NULL")
-            total = cursor.fetchone()
-            bot_data['total_trades'] = total[0] if total else 0
+            if "pnl_value" in columns:
+                cursor.execute("SELECT COUNT(*) FROM trades")
+                total = cursor.fetchone()
+                bot_data['total_trades'] = total[0] if total else 0
 
-            # Get wins
-            cursor.execute("SELECT COUNT(*) FROM trades WHERE exit_time IS NOT NULL AND profit > 0")
-            wins = cursor.fetchone()
-            bot_data['wins'] = wins[0] if wins else 0
+                cursor.execute("SELECT COUNT(*) FROM trades WHERE pnl_value > 0")
+                wins = cursor.fetchone()
+                bot_data['wins'] = wins[0] if wins else 0
 
-            # Get losses
-            cursor.execute("SELECT COUNT(*) FROM trades WHERE exit_time IS NOT NULL AND profit <= 0")
-            losses = cursor.fetchone()
-            bot_data['losses'] = losses[0] if losses else 0
+                cursor.execute("SELECT COUNT(*) FROM trades WHERE pnl_value <= 0")
+                losses = cursor.fetchone()
+                bot_data['losses'] = losses[0] if losses else 0
+            elif {"exit_time", "profit"}.issubset(columns):
+                cursor.execute("SELECT COUNT(*) FROM trades WHERE exit_time IS NOT NULL")
+                total = cursor.fetchone()
+                bot_data['total_trades'] = total[0] if total else 0
+
+                cursor.execute("SELECT COUNT(*) FROM trades WHERE exit_time IS NOT NULL AND profit > 0")
+                wins = cursor.fetchone()
+                bot_data['wins'] = wins[0] if wins else 0
+
+                cursor.execute("SELECT COUNT(*) FROM trades WHERE exit_time IS NOT NULL AND profit <= 0")
+                losses = cursor.fetchone()
+                bot_data['losses'] = losses[0] if losses else 0
+            else:
+                bot_data['total_trades'] = 0
+                bot_data['wins'] = 0
+                bot_data['losses'] = 0
 
             # Calculate win rate
             if bot_data['total_trades'] > 0:
                 bot_data['win_rate'] = (bot_data['wins'] / bot_data['total_trades']) * 100
+            else:
+                bot_data['win_rate'] = 0
 
             conn.close()
     except Exception as e:
@@ -134,19 +170,34 @@ def update_trade_stats():
 
 def monitor_bot_logs():
     """Monitor bot log file for updates"""
-    global bot_data
-    log_file = 'trading_log.txt'
+    global bot_data, log_file_offset
 
     try:
-        if os.path.exists(log_file):
-            with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
-                # Read last 100 lines
-                lines = f.readlines()
-                for line in lines[-100:]:
-                    if line.strip():
-                        bot_data['logs'].append(line.strip())
+        if not LOG_PATH.exists():
+            return
+
+        file_size = LOG_PATH.stat().st_size
+        if file_size < log_file_offset:
+            log_file_offset = 0
+
+        with open(LOG_PATH, 'r', encoding='utf-8', errors='ignore') as f:
+            f.seek(log_file_offset)
+            for line in f:
+                if line.strip():
+                    bot_data['logs'].append(line.strip())
+            log_file_offset = f.tell()
     except Exception as e:
         bot_data['logs'].append(f"[ERROR] Failed to read log file: {str(e)}")
+
+def update_spy_regime():
+    """Load the cached SPY regime used by the live bot."""
+    try:
+        bot_data['spy_regime'] = spy_regime_filter.get_regime()
+        bot_data['spy_regime_error'] = None
+    except Exception as e:
+        bot_data['spy_regime_error'] = str(e)
+        if bot_data.get('spy_regime') is None:
+            bot_data['spy_regime'] = None
 
 def update_loop():
     """Background thread to update data"""
@@ -155,6 +206,7 @@ def update_loop():
             update_balance()
             update_positions()
             update_trade_stats()
+            update_spy_regime()
             monitor_bot_logs()
             bot_data['last_update'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             bot_data['status'] = 'Running' if bot_process and bot_process.poll() is None else 'Stopped'
@@ -167,23 +219,13 @@ def start_bot():
     global bot_process
     try:
         if bot_process is None or bot_process.poll() is not None:
-            # Start the bot as a subprocess
             bot_process = subprocess.Popen(
                 [sys.executable, "main.py"],
-                cwd=os.path.dirname(os.path.abspath(__file__)),
-                stdout=subprocess.PIPE,
+                cwd=BOT_DIR,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.STDOUT,
-                universal_newlines=True,
-                bufsize=1
+                text=True,
             )
-
-            # Start a thread to read bot output
-            def read_output():
-                for line in bot_process.stdout:
-                    bot_data['logs'].append(line.strip())
-
-            output_thread = threading.Thread(target=read_output, daemon=True)
-            output_thread.start()
 
             bot_data['logs'].append("[INFO] Trading bot started")
             return True
@@ -279,8 +321,28 @@ HTML_TEMPLATE = '''
     <title>Trading Bot</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@500;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=Outfit:wght@500;700;800&display=swap" rel="stylesheet">
     <style>
+        :root {
+            --bg: #0b1016;
+            --bg-soft: #121923;
+            --panel: rgba(18, 24, 34, 0.82);
+            --panel-strong: rgba(15, 20, 29, 0.92);
+            --card: rgba(255, 255, 255, 0.05);
+            --border: rgba(255, 255, 255, 0.09);
+            --border-strong: rgba(255, 255, 255, 0.16);
+            --text: #f7f8fb;
+            --muted: #a5afbe;
+            --green: #88d58f;
+            --green-soft: #f5f7fb;
+            --green-tint: rgba(136, 213, 143, 0.10);
+            --green-line: rgba(136, 213, 143, 0.24);
+            --red: #ff8b8b;
+            --blue: #9bafff;
+            --shadow: 0 18px 44px rgba(4, 7, 13, 0.28);
+            --shadow-soft: 0 10px 24px rgba(4, 7, 13, 0.16);
+        }
+
         * {
             margin: 0;
             padding: 0;
@@ -288,125 +350,385 @@ HTML_TEMPLATE = '''
         }
 
         body {
-            font-family: 'Nunito', -apple-system, BlinkMacSystemFont, sans-serif;
-            background: #0f0f0f;
+            font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+            background:
+                radial-gradient(circle at 10% 0%, rgba(155, 175, 255, 0.13), transparent 24%),
+                radial-gradient(circle at 84% 8%, rgba(136, 213, 143, 0.09), transparent 20%),
+                linear-gradient(180deg, #0c1118 0%, #101722 54%, #0b1017 100%);
             min-height: 100vh;
-            color: #ffffff;
-            padding: 24px;
-            letter-spacing: -0.02em;
+            color: var(--text);
+            padding: 30px 24px 48px;
+            letter-spacing: -0.015em;
+            position: relative;
+            overflow-x: hidden;
+        }
+
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background:
+                radial-gradient(circle at top, rgba(255, 255, 255, 0.10), transparent 22%),
+                linear-gradient(180deg, rgba(255, 255, 255, 0.03), transparent 18%);
+            pointer-events: none;
+            opacity: 0.12;
         }
 
         .container {
-            max-width: 1200px;
+            max-width: 1320px;
             margin: 0 auto;
+            position: relative;
+            z-index: 1;
         }
 
         .header {
-            margin-bottom: 48px;
+            margin-bottom: 24px;
+        }
+
+        .hero {
+            position: relative;
+            overflow: hidden;
+            padding: 30px;
+            border-radius: 30px;
+            background:
+                radial-gradient(circle at top left, rgba(255, 255, 255, 0.08), transparent 28%),
+                linear-gradient(180deg, rgba(20, 26, 37, 0.95), rgba(14, 19, 28, 0.95));
+            border: 1px solid var(--border);
+            box-shadow: var(--shadow);
+        }
+
+        .hero::before {
+            content: '';
+            position: absolute;
+            left: 30px;
+            right: 30px;
+            top: 0;
+            height: 1px;
+            background: linear-gradient(90deg, rgba(255, 255, 255, 0.24), rgba(255, 255, 255, 0.04) 48%, transparent);
+            pointer-events: none;
+        }
+
+        .hero::after {
+            content: '';
+            position: absolute;
+            width: 240px;
+            height: 240px;
+            border-radius: 50%;
+            background: radial-gradient(circle, rgba(255, 255, 255, 0.08), transparent 70%);
+            top: -90px;
+            right: -60px;
+            pointer-events: none;
+        }
+
+        .hero-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 28px;
+            flex-wrap: wrap;
+        }
+
+        .hero-copy {
+            max-width: 700px;
+        }
+
+        .eyebrow {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 14px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            color: #ced6e2;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: -0.01em;
+            margin-bottom: 18px;
+        }
+
+        .eyebrow::before {
+            content: '';
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--green);
+            box-shadow: 0 0 0 6px rgba(136, 213, 143, 0.10);
+        }
+
+        .title-row {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            flex-wrap: wrap;
         }
 
         .title {
-            font-size: 48px;
+            font-family: 'Outfit', sans-serif;
+            font-size: clamp(40px, 5vw, 58px);
             font-weight: 800;
-            margin-bottom: 8px;
+            line-height: 0.96;
+            letter-spacing: -0.045em;
         }
 
         .title-text {
-            background: linear-gradient(135deg, #58CC02 0%, #89E219 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
+            color: var(--text);
             display: inline;
         }
 
         .subtitle {
-            font-size: 16px;
-            color: #777;
-            font-weight: 600;
+            display: none;
+        }
+
+        .hero-meta {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin-top: 22px;
         }
 
         .status {
-            display: inline-block;
-            padding: 8px 20px;
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            padding: 11px 16px;
             border-radius: 100px;
             font-size: 12px;
-            font-weight: 900;
-            margin-left: 16px;
-            text-transform: uppercase;
-            letter-spacing: 0.1em;
-            border: 2px solid;
+            font-weight: 700;
+            letter-spacing: -0.01em;
+            border: 1px solid var(--border-strong);
+            background: rgba(255, 255, 255, 0.04);
+        }
+
+        .status::before {
+            content: '';
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: currentColor;
+            box-shadow: 0 0 0 5px rgba(255, 255, 255, 0.06);
         }
 
         .status-running {
-            background: rgba(88, 204, 2, 0.15);
-            color: #58CC02;
-            border-color: #58CC02;
-            box-shadow: 0 0 20px rgba(88, 204, 2, 0.3);
+            background: rgba(143, 207, 140, 0.12);
+            color: var(--green);
+            border-color: rgba(143, 207, 140, 0.24);
         }
 
         .status-stopped {
-            background: rgba(255, 75, 75, 0.15);
-            color: #FF4B4B !important;
-            border-color: #FF4B4B;
-            -webkit-text-fill-color: #FF4B4B !important;
+            background: rgba(255, 75, 75, 0.14);
+            color: var(--red) !important;
+            border-color: rgba(255, 75, 75, 0.28);
+            -webkit-text-fill-color: var(--red) !important;
+        }
+
+        .meta-chip,
+        .last-update {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 11px 15px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.045);
+            border: 1px solid var(--border);
+            color: var(--muted);
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: -0.01em;
+        }
+
+        .controls {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+            align-items: flex-start;
+            padding: 8px;
+            border-radius: 24px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            box-shadow: var(--shadow-soft);
         }
 
         .metrics {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
             gap: 16px;
-            margin-bottom: 32px;
+            margin-bottom: 28px;
         }
 
         .metric {
-            background: #1c1c1c;
-            border: 1px solid #2a2a2a;
-            border-radius: 16px;
-            padding: 20px;
-            transition: all 0.2s ease;
+            position: relative;
+            overflow: hidden;
+            background: linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.028));
+            border: 1px solid var(--border);
+            border-radius: 24px;
+            padding: 22px;
+            transition: transform 0.2s ease, border-color 0.2s ease, background 0.2s ease;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02), var(--shadow-soft);
+        }
+
+        .metric::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 1px;
+            background: linear-gradient(90deg, rgba(255, 255, 255, 0.16), transparent 72%);
+            opacity: 1;
         }
 
         .metric:hover {
-            background: #222;
-            border-color: #333;
+            transform: translateY(-2px);
+            background: linear-gradient(180deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.03));
+            border-color: rgba(255, 255, 255, 0.13);
         }
 
         .metric-label {
             font-size: 12px;
-            color: #777;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-            margin-bottom: 8px;
+            color: var(--muted);
+            letter-spacing: -0.01em;
+            margin-bottom: 12px;
             font-weight: 700;
         }
 
         .metric-value {
-            font-size: 32px;
+            font-size: 31px;
             font-weight: 800;
-            line-height: 1;
+            line-height: 1.05;
+            font-variant-numeric: tabular-nums;
         }
 
         .metric-value.green {
-            color: #58CC02;
+            color: var(--green);
         }
 
         .metric-value.red {
+            color: var(--red);
+        }
+
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+            gap: 22px;
+            margin-bottom: 22px;
+            align-items: start;
+        }
+
+        .regime-card {
+            display: flex;
+            flex-direction: column;
+            gap: 18px;
+        }
+
+        .regime-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .regime-badge {
+            padding: 10px 14px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: -0.01em;
+            border: 1px solid transparent;
+        }
+
+        .regime-long {
+            color: var(--green);
+            background: rgba(143, 207, 140, 0.12);
+            border-color: rgba(143, 207, 140, 0.22);
+        }
+
+        .regime-short {
             color: #FF4B4B;
+            background: rgba(255, 75, 75, 0.14);
+            border-color: rgba(255, 75, 75, 0.24);
+        }
+
+        .regime-copy {
+            color: #c4ccd6;
+            font-size: 14px;
+            line-height: 1.6;
+            max-width: 52ch;
+        }
+
+        .detail-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+        }
+
+        .detail-card {
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid rgba(255, 255, 255, 0.07);
+            border-radius: 18px;
+            padding: 16px;
+        }
+
+        .detail-key {
+            font-size: 11px;
+            color: var(--muted);
+            letter-spacing: -0.01em;
+            margin-bottom: 8px;
+            font-weight: 700;
+        }
+
+        .detail-value {
+            font-size: 14px;
+            font-weight: 800;
+            line-height: 1.5;
+            word-break: break-word;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .pill-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .pill {
+            padding: 8px 12px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: -0.01em;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        .pill-warning {
+            color: #ffcf5b;
+            background: rgba(255, 207, 91, 0.12);
+            border-color: rgba(255, 207, 91, 0.25);
+        }
+
+        .pill-muted {
+            color: #b7b7b7;
+            background: rgba(255, 255, 255, 0.03);
         }
 
         .positions {
-            background: #1c1c1c;
-            border: 1px solid #2a2a2a;
-            border-radius: 16px;
-            padding: 24px;
-            margin-bottom: 24px;
+            background: linear-gradient(180deg, rgba(19, 25, 35, 0.94), rgba(14, 19, 28, 0.94));
+            border: 1px solid var(--border);
+            border-radius: 28px;
+            padding: 26px;
+            box-shadow: var(--shadow);
         }
 
         .section-header {
-            font-size: 20px;
-            font-weight: 800;
+            font-family: 'Outfit', sans-serif;
+            font-size: 22px;
+            font-weight: 700;
             margin-bottom: 20px;
-            color: #fff;
+            color: var(--text);
+            letter-spacing: -0.03em;
         }
 
         .position {
@@ -414,7 +736,7 @@ HTML_TEMPLATE = '''
             justify-content: space-between;
             align-items: center;
             padding: 16px 0;
-            border-bottom: 1px solid #2a2a2a;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
         }
 
         .position:last-child {
@@ -430,21 +752,20 @@ HTML_TEMPLATE = '''
         .coin-symbol {
             font-size: 18px;
             font-weight: 800;
-            color: #fff;
+            color: var(--text);
         }
 
         .position-side {
-            padding: 4px 12px;
+            padding: 7px 12px;
             border-radius: 100px;
             font-size: 11px;
-            font-weight: 800;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
+            font-weight: 700;
+            letter-spacing: -0.01em;
         }
 
         .side-long {
-            background: rgba(88, 204, 2, 0.2);
-            color: #58CC02;
+            background: rgba(143, 207, 140, 0.14);
+            color: var(--green);
         }
 
         .side-short {
@@ -457,30 +778,37 @@ HTML_TEMPLATE = '''
         }
 
         .entry-price {
-            font-size: 14px;
-            color: #777;
+            font-size: 13px;
+            color: var(--muted);
             margin-bottom: 4px;
+            font-variant-numeric: tabular-nums;
         }
 
         .position-pnl {
-            font-size: 16px;
+            font-size: 15px;
             font-weight: 800;
+            font-variant-numeric: tabular-nums;
         }
 
         .logs {
-            background: #1c1c1c;
-            border: 1px solid #2a2a2a;
-            border-radius: 16px;
-            padding: 24px;
+            background: linear-gradient(180deg, rgba(19, 25, 35, 0.94), rgba(14, 19, 28, 0.94));
+            border: 1px solid var(--border);
+            border-radius: 28px;
+            padding: 26px;
+            box-shadow: var(--shadow);
         }
 
         .log-container {
-            max-height: 280px;
+            max-height: 360px;
             overflow-y: auto;
-            font-family: 'SF Mono', 'Monaco', 'Inconsolata', monospace;
-            font-size: 13px;
-            line-height: 1.8;
-            color: #999;
+            font-family: 'IBM Plex Mono', 'SF Mono', 'Monaco', monospace;
+            font-size: 12px;
+            line-height: 1.72;
+            color: #a8b1be;
+            background: rgba(7, 10, 15, 0.50);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 20px;
+            padding: 18px;
         }
 
         .log-container::-webkit-scrollbar {
@@ -488,80 +816,95 @@ HTML_TEMPLATE = '''
         }
 
         .log-container::-webkit-scrollbar-track {
-            background: #1c1c1c;
+            background: transparent;
             border-radius: 4px;
         }
 
         .log-container::-webkit-scrollbar-thumb {
-            background: #333;
+            background: rgba(255, 255, 255, 0.12);
             border-radius: 4px;
         }
 
         .log-container::-webkit-scrollbar-thumb:hover {
-            background: #444;
+            background: rgba(255, 255, 255, 0.18);
         }
 
         .log-line {
-            padding: 2px 0;
+            padding: 4px 0;
+            border-bottom: 1px dashed rgba(255, 255, 255, 0.035);
             word-wrap: break-word;
         }
 
-        .controls {
-            position: fixed;
-            bottom: 32px;
-            right: 32px;
-            display: flex;
-            gap: 12px;
+        .log-line:last-child {
+            border-bottom: none;
         }
 
         .btn {
-            padding: 14px 32px;
-            border: none;
-            border-radius: 100px;
-            font-size: 16px;
-            font-weight: 800;
+            padding: 14px 22px;
+            border: 1px solid transparent;
+            border-radius: 18px;
+            font-size: 14px;
+            font-weight: 700;
             cursor: pointer;
-            transition: all 0.2s ease;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            font-family: 'Nunito', sans-serif;
+            transition: transform 0.18s ease, background 0.18s ease, border-color 0.18s ease;
+            letter-spacing: -0.01em;
+            font-family: 'DM Sans', sans-serif;
+            box-shadow: var(--shadow-soft);
+        }
+
+        .btn:disabled {
+            cursor: wait;
+            opacity: 0.78;
+            transform: none !important;
+        }
+
+        .btn-busy {
+            position: relative;
+        }
+
+        .btn-busy::after {
+            content: '';
+            width: 8px;
+            height: 8px;
+            margin-left: 10px;
+            border-radius: 50%;
+            display: inline-block;
+            vertical-align: middle;
+            background: currentColor;
+            opacity: 0.7;
+            animation: pulse 1s infinite;
         }
 
         .btn-start {
-            background: #58CC02;
-            color: #0f0f0f;
+            background: linear-gradient(180deg, #eff4ef 0%, #d6dfd5 100%);
+            border-color: rgba(255, 255, 255, 0.18);
+            color: #11161b;
+            box-shadow: 0 10px 22px rgba(4, 7, 13, 0.20), inset 0 -3px 0 rgba(17, 22, 27, 0.10);
         }
 
         .btn-start:hover {
-            background: #89E219;
-            transform: scale(1.05);
+            transform: translateY(-1px);
+            background: linear-gradient(180deg, #f6f8f5 0%, #dfe7de 100%);
         }
 
         .btn-stop {
-            background: #2a2a2a;
-            color: #fff;
+            background: rgba(255, 255, 255, 0.06);
+            border-color: var(--border);
+            color: var(--text);
         }
 
         .btn-stop:hover {
-            background: #FF4B4B;
-            transform: scale(1.05);
+            background: rgba(255, 255, 255, 0.06);
+            border-color: rgba(255, 255, 255, 0.14);
+            transform: translateY(-1px);
         }
 
         .empty-state {
             text-align: center;
-            padding: 40px;
-            color: #555;
+            padding: 46px 24px;
+            color: #6b786f;
             font-size: 14px;
-            font-weight: 600;
-        }
-
-        .last-update {
-            position: fixed;
-            bottom: 32px;
-            left: 32px;
-            font-size: 12px;
-            color: #555;
-            font-weight: 600;
+            font-weight: 700;
         }
 
         @keyframes pulse {
@@ -576,13 +919,168 @@ HTML_TEMPLATE = '''
         .loading {
             animation: pulse 2s infinite;
         }
+
         .btn-copy {
-            background: #2d7ff9;
-            color: #fff;
+            background: rgba(155, 175, 255, 0.15);
+            border-color: rgba(155, 175, 255, 0.20);
+            color: #edf1ff;
         }
+
         .btn-copy:hover {
-            background: #4e95ff;
-            transform: scale(1.05);
+            background: rgba(140, 166, 255, 0.14);
+            transform: translateY(-1px);
+        }
+
+        .btn-compact {
+            padding: 10px 14px;
+            font-size: 13px;
+            border-radius: 16px;
+        }
+
+        .modal-backdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(5, 7, 10, 0.76);
+            backdrop-filter: blur(10px);
+            z-index: 9999;
+            padding: 24px;
+        }
+
+        .modal-panel {
+            max-width: 580px;
+            margin: 64px auto;
+            background: linear-gradient(180deg, rgba(18, 22, 28, 0.98), rgba(11, 15, 20, 0.98));
+            border: 1px solid var(--border);
+            border-radius: 28px;
+            padding: 24px;
+            box-shadow: var(--shadow);
+        }
+
+        .modal-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 22px;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+
+        .modal-copy {
+            font-size: 14px;
+            color: var(--muted);
+            line-height: 1.6;
+            margin-bottom: 18px;
+        }
+
+        .form-input {
+            width: 100%;
+            margin-bottom: 12px;
+            padding: 14px 16px;
+            border-radius: 18px;
+            border: 1px solid var(--border);
+            background: rgba(255, 255, 255, 0.04);
+            color: var(--text);
+            font-size: 14px;
+            outline: none;
+            transition: border-color 0.18s ease, background 0.18s ease;
+        }
+
+        .form-input:focus {
+            border-color: rgba(140, 166, 255, 0.24);
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .modal-actions {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-bottom: 14px;
+        }
+
+        .followers-list {
+            max-height: 300px;
+            overflow: auto;
+            border-top: 1px solid rgba(255, 255, 255, 0.06);
+            padding-top: 12px;
+        }
+
+        .follower-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        }
+
+        .follower-row:last-child {
+            border-bottom: none;
+        }
+
+        .follower-label {
+            font-weight: 800;
+            margin-bottom: 4px;
+        }
+
+        .follower-meta {
+            font-size: 12px;
+            color: var(--muted);
+        }
+
+        .follower-actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        @media (max-width: 980px) {
+            .dashboard-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .hero {
+                padding: 24px;
+            }
+
+            .hero-top {
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .controls {
+                justify-content: flex-start;
+            }
+        }
+
+        @media (max-width: 640px) {
+            body {
+                padding: 18px 16px 32px;
+            }
+
+            .hero {
+                padding: 22px 18px;
+                border-radius: 22px;
+            }
+
+            .title {
+                font-size: 38px;
+            }
+
+            .metrics {
+                grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+            }
+
+            .btn {
+                flex: 1 1 100%;
+                justify-content: center;
+            }
+
+            .modal-backdrop {
+                padding: 16px;
+            }
+
+            .modal-panel {
+                margin: 24px auto;
+                padding: 18px;
+            }
         }
 
     </style>
@@ -590,11 +1088,29 @@ HTML_TEMPLATE = '''
 <body>
     <div class="container">
         <div class="header">
-            <div class="title">
-                <span class="title-text">Trading Bot</span>
-                <span class="status" id="status">Loading</span>
+            <div class="hero">
+                <div class="hero-top">
+                    <div class="hero-copy">
+                        <div class="eyebrow">Daily market filter</div>
+                        <div class="title-row">
+                            <div class="title">
+                                <span class="title-text">Trading Bot</span>
+                            </div>
+                        </div>
+                        <div class="hero-meta">
+                            <span class="status" id="status">Loading</span>
+                            <span class="meta-chip">9 tracked pairs</span>
+                            <span class="meta-chip">SPY bias active</span>
+                            <span class="last-update" id="last-update">Last update: Never</span>
+                        </div>
+                    </div>
+                    <div class="controls">
+                        <button class="btn btn-stop" id="stop-bot-btn" onclick="stopBot()">Stop bot</button>
+                        <button class="btn btn-copy" onclick="openCopyModal()">Copy trade</button>
+                        <button class="btn btn-start" id="start-bot-btn" onclick="startBot()">Start bot</button>
+                    </div>
+                </div>
             </div>
-            <div class="subtitle">Binance Futures • Testnet Mode</div>
         </div>
 
         <div class="metrics">
@@ -628,55 +1144,148 @@ HTML_TEMPLATE = '''
             </div>
         </div>
 
-        <div class="positions">
-            <div class="section-header">Active Positions</div>
-            <div id="positions-list">
-                <div class="empty-state">No active positions</div>
+        <div class="dashboard-grid">
+            <div class="positions">
+                <div class="section-header">SPY bias</div>
+                <div id="spy-regime-card">
+                    <div class="empty-state loading">Loading daily bias...</div>
+                </div>
+            </div>
+
+            <div class="positions">
+                <div class="section-header">Open positions</div>
+                <div id="positions-list">
+                    <div class="empty-state">No active positions</div>
+                </div>
             </div>
         </div>
 
         <div class="logs">
-            <div class="section-header">Terminal</div>
+            <div class="section-header">Recent activity</div>
             <div class="log-container" id="logs">
                 <div class="empty-state loading">Initializing...</div>
             </div>
         </div>
     </div>
-
-    <div class="controls">
-        <button class="btn btn-stop" onclick="stopBot()">Stop</button>
-        <button class="btn btn-copy" onclick="openCopyModal()">Copy Trade Bot</button>
-        <button class="btn btn-start" onclick="startBot()">Start</button>
-        
-    </div>
-
-    <div class="last-update" id="last-update">
-        Last update: Never
-    </div>
-    <div id="copy-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:9999;">
-        <div style="max-width:560px; margin:80px auto; background:#1c1c1c; border:1px solid #2a2a2a; border-radius:16px; padding:20px;">
-            <h3 style="margin-bottom:14px;">Copy Trade Followers (Testnet)</h3>
-
-            <input id="f-label" placeholder="Label (e.g. Friend A)" style="width:100%; margin-bottom:10px; padding:10px; border-radius:10px; border:1px solid #333; background:#111; color:#fff;" />
-            <input id="f-api" placeholder="Testnet API Key" style="width:100%; margin-bottom:10px; padding:10px; border-radius:10px; border:1px solid #333; background:#111; color:#fff;" />
-            <input id="f-secret" placeholder="Testnet Secret Key" type="password" style="width:100%; margin-bottom:10px; padding:10px; border-radius:10px; border:1px solid #333; background:#111; color:#fff;" />
-
-            <div style="display:flex; gap:8px; margin-bottom:12px;">
-                <button class="btn btn-start" style="padding:10px 16px; font-size:13px;" onclick="addFollower()">Add Follower</button>
-                <button class="btn btn-stop" style="padding:10px 16px; font-size:13px;" onclick="closeCopyModal()">Close</button>
+    <div id="copy-modal" class="modal-backdrop" style="display:none;">
+        <div class="modal-panel">
+            <h3 class="modal-title">Copy Trade Followers</h3>
+            <div class="modal-copy">
+                Add extra Binance Futures testnet accounts and mirror master entries and exits into them.
             </div>
 
-            <div id="followers-list" style="max-height:280px; overflow:auto; border-top:1px solid #2a2a2a; padding-top:12px;"></div>
+            <input id="f-label" class="form-input" placeholder="Label (e.g. Friend A)" />
+            <input id="f-api" class="form-input" placeholder="Testnet API Key" />
+            <input id="f-secret" class="form-input" placeholder="Testnet Secret Key" type="password" />
+
+            <div class="modal-actions">
+                <button class="btn btn-start btn-compact" onclick="addFollower()">Add Follower</button>
+                <button class="btn btn-stop btn-compact" onclick="closeCopyModal()">Close</button>
+            </div>
+
+            <div id="followers-list" class="followers-list"></div>
         </div>
-</div>
+    </div>
 
 
     <script>
+        let pendingBotAction = null;
+
         function formatNumber(num) {
             if (num >= 1000) {
                 return (num / 1000).toFixed(1) + 'k';
             }
             return num.toFixed(2);
+        }
+
+        function setBotButtonState(currentStatus) {
+            const startBtn = document.getElementById('start-bot-btn');
+            const stopBtn = document.getElementById('stop-bot-btn');
+            const isRunning = currentStatus === 'Running';
+
+            const actionResolved =
+                !pendingBotAction ||
+                (pendingBotAction === 'start' && isRunning) ||
+                (pendingBotAction === 'stop' && !isRunning);
+
+            if (actionResolved) {
+                pendingBotAction = null;
+            }
+
+            startBtn.classList.remove('btn-busy');
+            stopBtn.classList.remove('btn-busy');
+
+            startBtn.textContent = pendingBotAction === 'start' ? 'Starting...' : 'Start bot';
+            stopBtn.textContent = pendingBotAction === 'stop' ? 'Stopping...' : 'Stop bot';
+
+            if (pendingBotAction === 'start') {
+                startBtn.classList.add('btn-busy');
+            }
+
+            if (pendingBotAction === 'stop') {
+                stopBtn.classList.add('btn-busy');
+            }
+
+            if (pendingBotAction) {
+                startBtn.disabled = true;
+                stopBtn.disabled = true;
+                return;
+            }
+
+            startBtn.disabled = isRunning;
+            stopBtn.disabled = !isRunning;
+        }
+
+        function renderSpyRegime(spyRegime, spyError) {
+            const cardEl = document.getElementById('spy-regime-card');
+
+            if (!spyRegime) {
+                cardEl.innerHTML = `<div class="empty-state">${spyError ? `SPY regime unavailable: ${spyError}` : 'No daily bias cached yet'}</div>`;
+                return;
+            }
+
+            const regimeClass = spyRegime.regime === 'LONG_ONLY' ? 'regime-badge regime-long' : 'regime-badge regime-short';
+            const regimeLabel = spyRegime.regime === 'LONG_ONLY' ? 'Longs only' : 'Shorts only';
+            const missingExternal = (spyRegime.latest_missing_external || []);
+            const pills = missingExternal.length > 0
+                ? missingExternal.map(item => `<span class="pill pill-warning">${item}</span>`).join('')
+                : '<span class="pill pill-muted">All external features current</span>';
+
+            cardEl.innerHTML = `
+                <div class="regime-card">
+                    <div class="regime-header">
+                        <div>
+                            <div class="${regimeClass}">${regimeLabel}</div>
+                        </div>
+                        <div class="detail-value">${spyRegime.direction || 'Unknown'} • ${(spyRegime.confidence * 100).toFixed(1)}%</div>
+                    </div>
+                    <div class="regime-copy">
+                        Every new crypto entry must agree with this SPY direction until the next daily refresh.
+                    </div>
+                    <div class="detail-grid">
+                        <div class="detail-card">
+                            <div class="detail-key">As of</div>
+                            <div class="detail-value">${spyRegime.as_of_date || 'Unknown'}</div>
+                        </div>
+                        <div class="detail-card">
+                            <div class="detail-key">Predicting for</div>
+                            <div class="detail-value">${spyRegime.predicting_for || 'Unknown'}</div>
+                        </div>
+                        <div class="detail-card">
+                            <div class="detail-key">Data source</div>
+                            <div class="detail-value">${spyRegime.market_data_source || 'Unknown'}</div>
+                        </div>
+                        <div class="detail-card">
+                            <div class="detail-key">Cache status</div>
+                            <div class="detail-value">${spyRegime.cache_status || 'Unknown'}</div>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="detail-key">Lagging external features</div>
+                        <div class="pill-row">${pills}</div>
+                    </div>
+                </div>
+            `;
         }
 
         async function fetchData() {
@@ -686,8 +1295,9 @@ HTML_TEMPLATE = '''
 
                 // Update status
                 const statusEl = document.getElementById('status');
-                statusEl.textContent = data.status;
+                statusEl.textContent = data.status === 'Running' ? 'Running' : 'Stopped';
                 statusEl.className = `status ${data.status === 'Running' ? 'status-running' : 'status-stopped'}`;
+                setBotButtonState(data.status);
 
                 // Update metrics
                 document.getElementById('balance').textContent = formatNumber(data.balance);
@@ -701,6 +1311,8 @@ HTML_TEMPLATE = '''
                 const pnlEl = document.getElementById('pnl');
                 pnlEl.textContent = formatNumber(data.pnl);
                 pnlEl.className = `metric-value ${data.pnl >= 0 ? 'green' : 'red'}`;
+
+                renderSpyRegime(data.spy_regime, data.spy_regime_error);
 
                 // Update positions
                 const positionsEl = document.getElementById('positions-list');
@@ -728,7 +1340,7 @@ HTML_TEMPLATE = '''
                 if (data.logs.length > 0) {
                     // Clean logs from Unicode characters
                     const cleanLogs = data.logs.map(log =>
-                        log.replace(/\\u[\dA-F]{4}/gi, '').replace(/\\U[\dA-F]{8}/gi, '')
+                        log.replace(/\\u[\\dA-F]{4}/gi, '').replace(/\\U[\\dA-F]{8}/gi, '')
                     );
                     logsEl.innerHTML = cleanLogs.slice(-30).map(log =>
                         `<div class="log-line">${log}</div>`
@@ -747,26 +1359,50 @@ HTML_TEMPLATE = '''
         }
 
         async function startBot() {
+            if (pendingBotAction) {
+                return;
+            }
+
             try {
+                pendingBotAction = 'start';
+                setBotButtonState('Stopped');
                 const response = await fetch('/api/start', { method: 'POST' });
                 const result = await response.json();
                 if (!result.success) {
                     console.error('Failed to start bot:', result.message);
+                    pendingBotAction = null;
+                    setBotButtonState('Stopped');
+                    return;
                 }
+                await fetchData();
             } catch (error) {
                 console.error('Error starting bot:', error);
+                pendingBotAction = null;
+                setBotButtonState('Stopped');
             }
         }
 
         async function stopBot() {
+            if (pendingBotAction) {
+                return;
+            }
+
             try {
+                pendingBotAction = 'stop';
+                setBotButtonState('Running');
                 const response = await fetch('/api/stop', { method: 'POST' });
                 const result = await response.json();
                 if (!result.success) {
                     console.error('Failed to stop bot:', result.message);
+                    pendingBotAction = null;
+                    setBotButtonState('Running');
+                    return;
                 }
+                await fetchData();
             } catch (error) {
                 console.error('Error stopping bot:', error);
+                pendingBotAction = null;
+                setBotButtonState('Running');
             }
         }
         function openCopyModal() {
@@ -810,14 +1446,14 @@ HTML_TEMPLATE = '''
             }
 
             box.innerHTML = out.followers.map(f => `
-                <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-bottom:1px solid #2a2a2a;">
+                <div class="follower-row">
                     <div>
-                        <div style="font-weight:700;">${f.label}</div>
-                        <div style="font-size:12px; color:#888;">${f.api_key} • ${f.active ? 'ACTIVE' : 'PAUSED'}</div>
+                        <div class="follower-label">${f.label}</div>
+                        <div class="follower-meta">${f.api_key} • ${f.active ? 'ACTIVE' : 'PAUSED'}</div>
                     </div>
-                    <div style="display:flex; gap:8px;">
-                        <button class="btn btn-copy" style="padding:8px 12px; font-size:11px;" onclick="toggleFollower('${f.id}')">${f.active ? 'Pause' : 'Resume'}</button>
-                        <button class="btn btn-stop" style="padding:8px 12px; font-size:11px;" onclick="deleteFollower('${f.id}')">Remove</button>
+                    <div class="follower-actions">
+                        <button class="btn btn-copy btn-compact" onclick="toggleFollower('${f.id}')">${f.active ? 'Pause' : 'Resume'}</button>
+                        <button class="btn btn-stop btn-compact" onclick="deleteFollower('${f.id}')">Remove</button>
                     </div>
                 </div>
             `).join('');

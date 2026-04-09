@@ -1,10 +1,27 @@
-# 🤖 Crypto Futures Trading Bot with CMA-ES Optimization
-[![Python](https://img.shields.io/badge/Python-3.8%2B-blue)](https://www.python.org/)
-[![Binance](https://img.shields.io/badge/Exchange-Binance-yellow)](https://www.binance.com/)
-[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
-[![Status](https://img.shields.io/badge/Status-Active-success)](https://github.com/utkarsh-goel-21/crypto-futures-trading-bot)
+# Crypto Futures Trading Bot
 
-A futures trading bot optimized with CMA-ES algorithm on 13 months of historical data. Currently running on Binance with these 9 USDT perpetual pairs.
+The canonical live bot now lives in [binance-futures-trading-bot](./binance-futures-trading-bot).
+
+Important paths:
+
+- `binance-futures-trading-bot/trading-bot/main.py`: live Binance Futures bot
+- `binance-futures-trading-bot/trading-bot/web_server.py`: frontend + monitor
+- `binance-futures-trading-bot/spy_integration.py`: SPY LSTM daily bias cache/filter
+- `binance-futures-trading-bot/optimization.py`: optimizer/backtest path
+
+Quick start:
+
+```bash
+cd binance-futures-trading-bot
+../.venv/bin/pip install -r requirements.txt
+../.venv/bin/python RUN_BOT.py
+```
+
+Notes:
+
+- The live bot uses the sibling `spy-predictor` project as a daily regime filter.
+- Testnet credentials live in `binance-futures-trading-bot/trading-bot/apikey_testnet.py`.
+- Runtime artifacts such as logs, databases, follower data, and SPY cache files are intentionally gitignored.
 
 ## 📊 Performance Results
 

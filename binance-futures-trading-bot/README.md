@@ -46,13 +46,17 @@ A futures trading bot optimized with CMA-ES algorithm on 13 months of historical
 ## 📁 Repository Structure
 
 ```
-crypto-futures-trading-bot/
+binance-futures-trading-bot/
 ├── optimization.py                    # CMA-ES optimization engine
+├── spy_integration.py                 # SPY LSTM daily regime cache/filter
+├── RUN_BOT.py                         # Local launcher for the monitor UI
 ├── trading-bot/
 │   ├── main.py                       # Main trading bot logic
+│   ├── web_server.py                 # Frontend + API monitor
+│   ├── copy_trader.py                # Copy-trade follower management
 │   ├── indicators.py                 # Technical indicator calculations
 │   ├── config.py                     # Bot configuration
-│   ├── credentials.py                # API credentials (user adds keys)
+│   ├── apikey_testnet.py             # Testnet API credentials
 │   ├── environment.py                # Testnet/Mainnet toggle
 │   ├── stats.py                      # Performance tracking
 │   ├── enhanced_stats.py             # Advanced analytics
@@ -80,7 +84,7 @@ crypto-futures-trading-bot/
 1. **Clone the repository**
 ```bash
 git clone https://github.com/utkarsh-goel-21/crypto-futures-trading-bot.git
-cd crypto-futures-trading-bot
+cd crypto-futures-trading-bot/binance-futures-trading-bot
 ```
 
 2. **Install dependencies**
@@ -90,13 +94,9 @@ pip install -r requirements.txt
 
 3. **Configure API credentials**
 ```python
-# Edit trading-bot/credentials.py
-if USE_TESTNET:
-    BINANCE_API_KEY = 'your_testnet_api_key'
-    BINANCE_API_SECRET = 'your_testnet_api_secret'
-else:
-    BINANCE_API_KEY = 'your_mainnet_api_key'
-    BINANCE_API_SECRET = 'your_mainnet_api_secret'
+# Edit trading-bot/apikey_testnet.py
+testnet_api_key = 'your_testnet_api_key'
+testnet_secret_key = 'your_testnet_api_secret'
 ```
 
 4. **Configure trading settings**
@@ -109,12 +109,12 @@ TELEGRAM_ENABLED = True          # Enable notifications
 
 5. **Run the bot**
 ```bash
-# For testnet (recommended for testing)
-cd trading-bot
-python main.py --testnet
+# Monitor UI + live bot
+python RUN_BOT.py
 
-# For mainnet (real trading)
-python main.py
+# Or run the web monitor directly
+cd trading-bot
+python web_server.py
 ```
 
 ## ⚙️ Configuration

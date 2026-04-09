@@ -126,14 +126,16 @@ else:
 # ========================================
 # DO NOT MODIFY BELOW
 # ========================================
-import os
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
 
 # Auto-generate parameter file paths
 PARAM_FILES = {}
 for coin in ACTIVE_COINS:
-    param_file = f'parameters/{coin.lower()}_params.json'
-    if os.path.exists(param_file):
-        PARAM_FILES[coin] = param_file
+    param_file = BASE_DIR / 'parameters' / f'{coin.lower()}_params.json'
+    if param_file.exists():
+        PARAM_FILES[coin] = str(param_file)
     else:
         print(f"⚠️ Warning: Parameter file not found for {coin}: {param_file}")
 

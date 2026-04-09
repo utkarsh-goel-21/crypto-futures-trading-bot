@@ -7,6 +7,7 @@ __pycache__/
 env/
 venv/
 ENV/
+.venv/
 
 # API Keys and Credentials
 apikey.py
@@ -18,6 +19,8 @@ secrets.py
 *.db
 *.log
 logs/
+spy_regime_cache.json
+followers.json
 
 # IDE
 .vscode/

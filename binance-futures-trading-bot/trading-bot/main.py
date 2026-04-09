@@ -100,6 +100,45 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+
+def serialize_order_reference(order_response):
+    """Convert a Binance order payload into a stable reference string."""
+    if not order_response:
+        return None
+
+    if isinstance(order_response, str):
+        return order_response
+
+    if isinstance(order_response, dict):
+        order_id = order_response.get('orderId')
+        if order_id not in (None, ''):
+            return f"oid:{order_id}"
+
+        algo_id = order_response.get('algoId')
+        if algo_id not in (None, ''):
+            return f"aid:{algo_id}"
+
+        client_order_id = order_response.get('clientOrderId')
+        if client_order_id:
+            return f"cid:{client_order_id}"
+
+        client_algo_id = order_response.get('clientAlgoId')
+        if client_algo_id:
+            return f"caid:{client_algo_id}"
+
+    return None
+
+
+def format_order_reference(order_ref):
+    """Return a human-readable order reference for logs."""
+    if not order_ref:
+        return 'N/A'
+
+    if isinstance(order_ref, str) and ':' in order_ref:
+        return order_ref.split(':', 1)[1]
+
+    return str(order_ref)
+
 # ========================================
 # DATABASE CLEANUP FUNCTION (NEW)
 # ========================================
@@ -206,8 +245,8 @@ class PositionTracker:
         with self.lock:
             self.positions[coin] = data
             logger.info(f"📈 Position opened: {coin} - {data['side']} @ ${data['entry_price']:.2f}")
-            logger.info(f"   TP Order ID: {data.get('tp_order_id', 'N/A')}")
-            logger.info(f"   SL Order ID: {data.get('sl_order_id', 'N/A')}")
+            logger.info(f"   TP Order ID: {format_order_reference(data.get('tp_order_id'))}")
+            logger.info(f"   SL Order ID: {format_order_reference(data.get('sl_order_id'))}")
     
     def remove_position(self, coin):
         """Remove closed position"""
@@ -471,6 +510,47 @@ class TradingBot:
             return price
         except:
             return price
+
+    def resolve_order_lookup_params(self, coin, order_ref):
+        """Build Binance lookup params from a stored order reference."""
+        if not order_ref or order_ref == 'N/A':
+            return None
+
+        if isinstance(order_ref, str):
+            if order_ref.startswith('paper:') or 'PAPER' in order_ref:
+                return None
+
+            if order_ref.startswith('oid:'):
+                raw_order_id = order_ref.split(':', 1)[1]
+                try:
+                    order_id = int(raw_order_id)
+                except ValueError:
+                    order_id = raw_order_id
+                return {'symbol': coin, 'orderId': order_id}
+
+            if order_ref.startswith('aid:'):
+                raw_algo_id = order_ref.split(':', 1)[1]
+                try:
+                    algo_id = int(raw_algo_id)
+                except ValueError:
+                    algo_id = raw_algo_id
+                return {'symbol': coin, 'algoId': algo_id}
+
+            if order_ref.startswith('cid:'):
+                return {'symbol': coin, 'origClientOrderId': order_ref.split(':', 1)[1]}
+
+            if order_ref.startswith('caid:'):
+                return {'symbol': coin, 'clientAlgoId': order_ref.split(':', 1)[1]}
+
+            if order_ref.isdigit():
+                return {'symbol': coin, 'orderId': int(order_ref)}
+
+            return {'symbol': coin, 'origClientOrderId': order_ref}
+
+        if isinstance(order_ref, (int, float)):
+            return {'symbol': coin, 'orderId': int(order_ref)}
+
+        return None
     
     def close_position_market(self, coin, reason="SIGNAL_REVERSAL"):
         """
@@ -527,9 +607,9 @@ class TradingBot:
             # Place market entry order
             if PAPER_TRADING:
                 logger.info(f"📝 PAPER TRADE: {side} {quantity} {coin} @ ${entry_price:.2f}")
-                entry_order = {'orderId': 'PAPER_ENTRY_' + str(time.time())}
-                tp_order = {'orderId': 'PAPER_TP_' + str(time.time())}
-                sl_order = {'orderId': 'PAPER_SL_' + str(time.time())}
+                entry_order_ref = f"paper:entry:{time.time()}"
+                tp_order_ref = f"paper:tp:{time.time()}"
+                sl_order_ref = f"paper:sl:{time.time()}"
             else:
                 # Place real entry order
                 if side == 'BUY':
@@ -548,6 +628,10 @@ class TradingBot:
                     )
                 
                 logger.info(f"✅ Entry order placed: {side} {quantity} {coin}")
+                entry_order_ref = serialize_order_reference(entry_order)
+                if not entry_order_ref:
+                    logger.error(f"❌ Entry order response missing identifiers for {coin}: {entry_order}")
+                    return None, None, None
                 
                 # Calculate TP and SL prices
                 if side == 'BUY':  # LONG position
@@ -577,10 +661,14 @@ class TradingBot:
                         reduceOnly=True,
                         workingType='MARK_PRICE'
                     )
-                    logger.info(f"✅ TP order placed: {tp_order['orderId']}")
+                    tp_order_ref = serialize_order_reference(tp_order)
+                    if tp_order_ref:
+                        logger.info(f"✅ TP order placed: {format_order_reference(tp_order_ref)}")
+                    else:
+                        logger.error(f"❌ TP order response missing identifiers for {coin}: {tp_order}")
                 except Exception as e:
                     logger.error(f"❌ Failed to place TP order: {e}")
-                    tp_order = {'orderId': None}
+                    tp_order_ref = None
                 
                 # Place SL order
                 try:
@@ -593,17 +681,21 @@ class TradingBot:
                         reduceOnly=True,
                         workingType='MARK_PRICE'
                     )
-                    logger.info(f"✅ SL order placed: {sl_order['orderId']}")
+                    sl_order_ref = serialize_order_reference(sl_order)
+                    if sl_order_ref:
+                        logger.info(f"✅ SL order placed: {format_order_reference(sl_order_ref)}")
+                    else:
+                        logger.error(f"❌ SL order response missing identifiers for {coin}: {sl_order}")
                 except Exception as e:
                     logger.error(f"❌ Failed to place SL order: {e}")
-                    sl_order = {'orderId': None}
+                    sl_order_ref = None
 
                 notifier.send_trade_alert(coin, side, entry_price)
                 # Discord disabled for now
                 # if DISCORD_AVAILABLE:
                 #     discord.send_trade_alert(coin, side, entry_price,tp_price,sl_price)
             
-            return entry_order, tp_order, sl_order
+            return entry_order_ref, tp_order_ref, sl_order_ref
             
         except Exception as e:
             logger.error(f"❌ Failed to place orders for {coin}: {e}")
@@ -611,33 +703,35 @@ class TradingBot:
     
     def cancel_order_safe(self, coin, order_id):
         """Safely cancel an order"""
-        if not order_id or order_id == 'N/A' or 'PAPER' in str(order_id):
+        lookup_params = self.resolve_order_lookup_params(coin, order_id)
+        if not lookup_params:
             return True
         
         try:
-            self.client.futures_cancel_order(
-                symbol=coin,
-                orderId=order_id
-            )
-            logger.info(f"✅ Cancelled order {order_id} for {coin}")
+            self.client.futures_cancel_order(**lookup_params)
+            logger.info(f"✅ Cancelled order {format_order_reference(order_id)} for {coin}")
             return True
         except BinanceAPIException as e:
             if 'Unknown order' in str(e) or 'ORDER_DOES_NOT_EXIST' in str(e):
                 # Order already filled or cancelled
                 return True
-            logger.error(f"❌ Failed to cancel order {order_id}: {e}")
+            logger.error(f"❌ Failed to cancel order {format_order_reference(order_id)}: {e}")
             return False
     
     def check_order_status(self, coin, order_id):
         """Check if an order is filled"""
-        if not order_id or 'PAPER' in str(order_id):
+        if not order_id:
+            return 'PAPER' if PAPER_TRADING else 'MISSING'
+
+        if isinstance(order_id, str) and (order_id.startswith('paper:') or 'PAPER' in order_id):
             return 'PAPER'
+
+        lookup_params = self.resolve_order_lookup_params(coin, order_id)
+        if not lookup_params:
+            return 'MISSING'
         
         try:
-            order = self.client.futures_get_order(
-                symbol=coin,
-                orderId=order_id
-            )
+            order = self.client.futures_get_order(**lookup_params)
             return order['status']
         except:
             return 'UNKNOWN'
@@ -756,20 +850,20 @@ class TradingBot:
             if quantity:
                 # Place entry with TP/SL orders
                 side = 'BUY' if signal == 'LONG' else 'SELL'
-                entry_order, tp_order, sl_order = self.place_entry_with_tp_sl(
+                entry_order_ref, tp_order_ref, sl_order_ref = self.place_entry_with_tp_sl(
                     coin, side, quantity, entry_price
                 )
                 
-                if entry_order:
+                if entry_order_ref:
                     # Track position with all order IDs
                     self.position_tracker.add_position(coin, {
                         'side': signal,
                         'entry_price': entry_price,
                         'quantity': quantity,
                         'entry_time': datetime.now(),
-                        'entry_order_id': entry_order['orderId'],
-                        'tp_order_id': tp_order['orderId'] if tp_order else 'N/A',
-                        'sl_order_id': sl_order['orderId'] if sl_order else 'N/A',
+                        'entry_order_id': entry_order_ref,
+                        'tp_order_id': tp_order_ref,
+                        'sl_order_id': sl_order_ref,
                         'tp_price': entry_price * (1 + manager.params['parameters']['tp_percent']) if signal == 'LONG' else entry_price * (1 - manager.params['parameters']['tp_percent']),
                         'sl_price': entry_price * (1 - manager.params['parameters']['sl_percent']) if signal == 'LONG' else entry_price * (1 + manager.params['parameters']['sl_percent'])
                              
@@ -849,7 +943,8 @@ class TradingBot:
                 return 'SL'
             
             # Check if both orders somehow disappeared (wait longer on testnet)
-            if tp_status == 'UNKNOWN' and sl_status == 'UNKNOWN' and not PAPER_TRADING:
+            missing_statuses = {'UNKNOWN', 'MISSING'}
+            if tp_status in missing_statuses and sl_status in missing_statuses and not PAPER_TRADING:
                 # On testnet, give orders more time to appear (testnet is slower)
                 position_age = (datetime.now() - position.get('entry_time', datetime.now())).total_seconds()
                 if position_age < 30:  # Wait 30 seconds before panicking on testnet
@@ -1113,7 +1208,14 @@ class TradingBot:
     def start(self):
         """Start the bot"""
         logger.info("🚀 Starting bot...")
-        logger.info(f"   Mode: {'PAPER TRADING' if PAPER_TRADING else 'REAL MONEY'}")
+        environment_label = "TESTNET" if USE_TESTNET else "MAINNET"
+        execution_label = (
+            "PAPER TRADING"
+            if PAPER_TRADING
+            else ("LIVE TESTNET ORDERS" if USE_TESTNET else "LIVE MAINNET ORDERS")
+        )
+        logger.info(f"   Environment: {environment_label}")
+        logger.info(f"   Execution: {execution_label}")
         logger.info(f"   Strategy: NORMAL TP/SL EXITS - Matching optimization backtest")
         logger.info(f"   Coins: {', '.join(ACTIVE_COINS)}")
         logger.info(f"   Balance: ${self.account_balance:.2f} USDT")
