@@ -26,14 +26,25 @@ import sys
 import pandas as pd
 import platform
 import asyncio
+from pathlib import Path
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from decimal import Decimal, ROUND_DOWN
 
+PROJECT_ROOT = next(
+    (parent for parent in Path(__file__).resolve().parents if (parent / "spy_integration.py").exists()),
+    None
+)
+if PROJECT_ROOT is None:
+    raise RuntimeError("Could not locate project root for SPY regime integration.")
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 # Import configuration and indicators
 from config import *
 from environment import USE_TESTNET
+from spy_integration import SpyRegimeFilter
 
 # Import appropriate API keys based on environment
 if USE_TESTNET:
@@ -293,6 +304,7 @@ class TradingBot:
         
         # OPTIMIZATION ALIGNMENT: Pending signals for delayed execution
         self.pending_signals = {}  # {coin: {'signal': 'LONG/SHORT', 'strength': float, 'filters': dict}}
+        self.spy_regime_filter = SpyRegimeFilter(PROJECT_ROOT)
 
         stats_tracker.update_position_tracker(self.position_tracker)
 
@@ -308,6 +320,46 @@ class TradingBot:
         
         # Set up leverage and margin mode
         self.setup_trading_params()
+
+        # Preload the daily SPY regime so entry gating uses a stable cached bias.
+        self.log_active_spy_regime()
+
+    def log_active_spy_regime(self):
+        """Log the currently active cached SPY regime."""
+        try:
+            regime = self.spy_regime_filter.get_regime()
+            logger.info(
+                "🧭 Active SPY regime: %s | as_of=%s | predicting_for=%s | source=%s | cache=%s",
+                regime.get('regime', 'unknown'),
+                regime.get('as_of_date', 'unknown'),
+                regime.get('predicting_for', 'unknown'),
+                regime.get('market_data_source', 'unknown'),
+                regime.get('cache_status', 'unknown'),
+            )
+        except Exception as exc:
+            logger.error(f"❌ Failed to load SPY regime on startup: {exc}")
+
+    def is_signal_allowed_by_spy(self, coin, signal, phase):
+        """Allow only trades aligned with the cached daily SPY regime."""
+        allowed, regime = self.spy_regime_filter.is_signal_allowed(signal)
+        if regime is None:
+            logger.warning(f"🚫 {coin} {phase} blocked: SPY regime unavailable")
+            return False
+
+        if allowed:
+            return True
+
+        logger.info(
+            "🚫 %s %s blocked by SPY regime %s | signal=%s | as_of=%s | predicting_for=%s | cache=%s",
+            coin,
+            phase,
+            regime.get('regime', 'unknown'),
+            signal,
+            regime.get('as_of_date', 'unknown'),
+            regime.get('predicting_for', 'unknown'),
+            regime.get('cache_status', 'unknown'),
+        )
+        return False
     
     def load_coins(self):
         """Load all coin configurations"""
@@ -635,6 +687,10 @@ class TradingBot:
                 signal = pending['signal']
                 strength = pending['strength']
                 filters = pending['filters']
+
+                if not self.is_signal_allowed_by_spy(coin, signal, "pending entry"):
+                    del self.pending_signals[coin]
+                    return
                 
                 # Check balance and position limits
                 if self.account_balance >= MARGIN_PER_TRADE and \
@@ -663,6 +719,9 @@ class TradingBot:
             signal, strength, filters = manager.indicator_calc.get_entry_signal_delayed(entry_df, trend_df)
             
             if signal:
+                if not self.is_signal_allowed_by_spy(coin, signal, "new signal"):
+                    return
+
                 # Store as pending signal for execution on NEXT candle close
                 self.pending_signals[coin] = {
                     'signal': signal,
