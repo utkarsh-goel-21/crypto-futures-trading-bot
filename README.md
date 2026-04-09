@@ -1,31 +1,296 @@
-# Crypto Futures Trading Bot
+# Crypto Futures Bot with SPY Regime Filter
 
-The canonical live bot now lives in [binance-futures-trading-bot](./binance-futures-trading-bot).
+A Binance Futures trading system that combines a multi-indicator crypto strategy with a daily SPY LSTM bias filter from the sibling `spy-predictor` project. It includes an optimizer, a live trading bot, a web monitor, and optional copy-trade follower support.
 
-Important paths:
+---
 
-- `binance-futures-trading-bot/trading-bot/main.py`: live Binance Futures bot
-- `binance-futures-trading-bot/trading-bot/web_server.py`: frontend + monitor
-- `binance-futures-trading-bot/spy_integration.py`: SPY LSTM daily bias cache/filter
-- `binance-futures-trading-bot/optimization.py`: optimizer/backtest path
+## What It Does
 
-Quick start:
+Run the live bot across 9 USDT perpetual pairs while enforcing a daily macro gate from SPY:
 
-```bash
-cd binance-futures-trading-bot
-../.venv/bin/pip install -r requirements.txt
-../.venv/bin/python RUN_BOT.py
+- _"Should new crypto entries be long-only or short-only today?"_
+- _"What positions are currently open on Binance Futures?"_
+- _"What does the live bot think right now on each candle close?"_
+- _"How did the optimized parameter sets perform in crypto-only backtests?"_
+
+The live system combines:
+1. **Coin-specific multi-indicator logic** optimized from historical crypto data
+2. **1-candle delayed execution** aligned with the live bot's intended backtest behavior
+3. **Daily SPY LSTM regime filter** fetched from the sibling `spy-predictor` project
+4. **Binance Futures execution** with market entries and exchange-side TP/SL orders
+5. **Flask monitor UI** for balances, positions, logs, and SPY regime state
+
+The canonical live application lives in `binance-futures-trading-bot/`.
+
+---
+
+## Architecture Overview
+
+```text
+User opens monitor UI
+           |
+           v
+   +-------------------+
+   | Flask Web Monitor |  <- trading-bot/web_server.py
+   +---------+---------+
+             |
+             v
+   +-------------------+
+   | Live Trading Bot  |  <- trading-bot/main.py
+   +---------+---------+
+             |
+             v
+   +-------------------+
+   | Technical Signals |  <- indicators.py + per-coin parameters
+   +---------+---------+
+             |
+             v
+   +-------------------+
+   | SPY Daily Gate    |  <- spy_integration.py -> sibling spy-predictor
+   +---------+---------+
+             |
+             v
+   +-------------------+
+   | Binance Futures   |  <- entries + TP/SL algo orders
+   +---------+---------+
+             |
+             v
+   +-------------------+
+   | Logs / SQLite / UI|
+   +-------------------+
 ```
 
-Notes:
+### Signal Gate Logic
 
-- The live bot uses the sibling `spy-predictor` project as a daily regime filter.
-- Testnet credentials live in `binance-futures-trading-bot/trading-bot/apikey_testnet.py`.
-- Runtime artifacts such as logs, databases, follower data, and SPY cache files are intentionally gitignored.
+| Crypto Signal | SPY Regime | Result |
+|---------------|------------|--------|
+| LONG | `LONG_ONLY` | **Allowed** |
+| SHORT | `SHORT_ONLY` | **Allowed** |
+| LONG | `SHORT_ONLY` | Blocked |
+| SHORT | `LONG_ONLY` | Blocked |
 
-## 📊 Performance Results
+The SPY regime is cached for 24 hours and reused across the trading day.
 
-### Optimization Results (13 Months of Data)
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|------------|
+| **Exchange API** | `python-binance`, Binance Futures Testnet/Mainnet |
+| **Live Bot** | Python, pandas, NumPy |
+| **Indicators** | `ta` + custom weighted signal logic |
+| **Optimizer** | CMA-ES (`cma`), SciPy |
+| **Monitor UI** | Flask, Flask-CORS, inline HTML/CSS/JS |
+| **Persistence** | SQLite, rotating log files |
+| **Notifications** | Telegram, Discord webhook |
+| **Macro Filter** | Sibling `spy-predictor` LSTM via `spy_integration.py` |
+
+---
+
+## Strategy Inputs
+
+The live crypto bot uses optimized parameter sets per coin and combines several signal categories:
+
+| Category | Examples |
+|----------|----------|
+| **Trend** | EMA direction, price vs EMA, higher-timeframe confirmation |
+| **Momentum** | RSI, MACD-style momentum, stochastic behavior |
+| **Volatility** | ATR-based checks, volatility filters |
+| **Structure** | Support/resistance, market structure scoring |
+| **Participation** | Volume spike and confirmation filters |
+| **Macro Gate** | Daily SPY `LONG_ONLY` / `SHORT_ONLY` regime |
+
+The optimizer/backtest path remains crypto-only. The SPY filter is currently applied to the live bot only.
+
+---
+
+## Project Structure
+
+```text
+crypto-futures-trading-bot/
+├── README.md
+├── .gitignore
+└── binance-futures-trading-bot/
+    ├── README.md
+    ├── RUN_BOT.py                 # Local launcher for the monitor UI
+    ├── optimization.py            # CMA-ES optimization / backtest path
+    ├── spy_integration.py         # Daily SPY regime cache + filter
+    ├── test_connection.py         # Binance testnet connectivity check
+    ├── requirements.txt
+    └── trading-bot/
+        ├── main.py                # Live trading bot
+        ├── web_server.py          # Monitor UI + JSON API
+        ├── indicators.py          # Technical signal generation
+        ├── config.py              # Coins, leverage, risk settings
+        ├── environment.py         # Testnet/mainnet toggle
+        ├── copy_trader.py         # Follower account mirroring
+        ├── apikey_testnet.py      # Testnet API credentials
+        ├── stats.py
+        ├── enhanced_stats.py
+        ├── telegram_notifier.py
+        ├── discord_notifier.py
+        └── parameters/            # Optimized JSON parameters for each coin
+```
+
+Runtime artifacts such as logs, SQLite databases, follower files, caches, and virtual environments are intentionally gitignored.
+
+---
+
+## Setup & Installation
+
+### Prerequisites
+
+- Python 3.10+
+- A Binance Futures Testnet account
+- A discoverable checkout of the sibling `spy-predictor` project
+
+Recommended layout:
+
+```text
+parent-folder/
+├── crypto-futures-trading-bot/
+└── spy-predictor/
+```
+
+---
+
+### Live Bot Setup
+
+#### 1. Clone the repository
+
+```bash
+git clone https://github.com/utkarsh-goel-21/crypto-futures-trading-bot.git
+cd crypto-futures-trading-bot/binance-futures-trading-bot
+```
+
+#### 2. Create and activate a virtual environment
+
+```bash
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+```
+
+#### 3. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+#### 4. Configure environment and API keys
+
+Set testnet or mainnet mode in `trading-bot/environment.py`:
+
+```python
+USE_TESTNET = True
+```
+
+Add your Binance Futures testnet credentials to `trading-bot/apikey_testnet.py`.
+
+#### 5. Verify the Binance connection
+
+```bash
+python test_connection.py
+```
+
+#### 6. Launch the monitor + live bot
+
+```bash
+python RUN_BOT.py
+```
+
+The monitor opens on `http://127.0.0.1:5000` by default unless that port is already occupied.
+
+---
+
+### Direct Monitor Launch
+
+If you want to run the monitor directly:
+
+```bash
+cd trading-bot
+python web_server.py
+```
+
+This starts:
+- the Flask monitor UI
+- the background live trading bot process
+- account / position / log polling
+
+---
+
+## Monitor API Reference
+
+### `GET /`
+Serves the trading monitor UI.
+
+### `GET /api/data`
+Returns live monitor state.
+
+**Response:**
+
+```json
+{
+  "status": "Running",
+  "environment": "TESTNET",
+  "balance": 4918.59,
+  "pnl": 0.0,
+  "active_trades": [
+    {
+      "symbol": "BTCUSDT",
+      "amount": 0.014,
+      "entry_price": 71360.0,
+      "pnl": -0.06,
+      "side": "LONG"
+    }
+  ],
+  "spy_regime": {
+    "regime": "LONG_ONLY",
+    "direction": "UP",
+    "confidence": 0.8337,
+    "as_of_date": "2026-04-08",
+    "predicting_for": "2026-04-09",
+    "market_data_source": "alphavantage",
+    "cache_status": "cached"
+  }
+}
+```
+
+### `POST /api/start`
+Starts the live bot process if it is not already running.
+
+### `POST /api/stop`
+Stops the live bot process.
+
+### `GET /api/followers`
+Lists configured copy-trade follower accounts.
+
+### `POST /api/followers`
+Adds a follower account.
+
+### `POST /api/followers/<id>/toggle`
+Enables or disables a follower account.
+
+### `DELETE /api/followers/<id>`
+Removes a follower account.
+
+---
+
+## Optimization & Backtesting
+
+Run the crypto-only optimizer from the canonical app root:
+
+```bash
+python optimization.py
+```
+
+Optimization characteristics:
+- **13 months** of 1-minute crypto candle data
+- **CMA-ES** evolutionary search over strategy parameters
+- **Trading costs included**: taker fees, slippage, spread
+- **Per-coin parameter export** to `trading-bot/parameters/*.json`
+
+### Optimization Snapshot
 
 | Coin | Win Rate | Total Return | Sharpe Ratio | Max Drawdown |
 |------|----------|--------------|--------------|--------------|
@@ -39,251 +304,28 @@ Notes:
 | **ADAUSDT** | 61.3% | +33.0% | 3.78 | -1.6% |
 | **BCHUSDT** | 60.6% | +23.5% | 3.71 | -1.0% |
 
-**Optimization details:** 
-- Dataset: 13 months of 1-minute candles
-- Costs included: 0.04% taker fees, 0.03% slippage, 0.01% spread
-- Settings: 10x leverage, $100 USDT margin per trade
+---
 
-## 🚀 Key Features
+## Live Execution Notes
 
-### Key Features
-- **Multi-indicator strategy**: Combines 14+ technical indicators with weighted signals
-- **CMA-ES optimization**: Evolutionary algorithm for parameter optimization
-- **Risk management**: Daily loss limits, position sizing, consecutive loss protection
-- **Live trading**: Supports both testnet and mainnet on Binance Futures
-- **Notifications**: Telegram and Discord alerts for trades
-
-### Live Trading Features
-- Runs on 9 pairs simultaneously
-- Telegram/Discord notifications for every trade
-- Full testnet support (practice with fake money first)
-- SQLite database tracks everything
-- WebSocket connections for real-time data
-
-## 📁 Repository Structure
-
-```
-crypto-futures-trading-bot/
-├── optimization.py                    # CMA-ES optimization engine
-├── trading-bot/
-│   ├── main.py                       # Main trading bot logic
-│   ├── indicators.py                 # Technical indicator calculations
-│   ├── config.py                     # Bot configuration
-│   ├── credentials.py                # API credentials (user adds keys)
-│   ├── environment.py                # Testnet/Mainnet toggle
-│   ├── stats.py                      # Performance tracking
-│   ├── enhanced_stats.py             # Advanced analytics
-│   ├── telegram_notifier.py          # Telegram notifications
-│   ├── discord_notifier.py           # Discord notifications
-│   └── parameters/                   # Optimized parameters for each coin
-│       ├── btcusdt_params.json
-│       ├── ethusdt_params.json
-│       └── ... (all 9 pairs)
-├── requirements.txt                  # Python dependencies
-├── LICENSE                          # MIT License with disclaimers
-└── README.md                        # This file
-```
-
-## 🛠️ Installation
-
-### What You Need
-- Python 3.8+
-- Binance account with Futures enabled
-- Linux/Mac/Windows (WSL2)
-- 4GB RAM minimum
-
-### Quick Setup
-
-1. **Clone the repository**
-```bash
-git clone https://github.com/utkarsh-goel-21/crypto-futures-trading-bot.git
-cd crypto-futures-trading-bot
-```
-
-2. **Install dependencies**
-```bash
-pip install -r requirements.txt
-```
-
-3. **Configure API credentials**
-```python
-# Edit trading-bot/credentials.py
-if USE_TESTNET:
-    BINANCE_API_KEY = 'your_testnet_api_key'
-    BINANCE_API_SECRET = 'your_testnet_api_secret'
-else:
-    BINANCE_API_KEY = 'your_mainnet_api_key'
-    BINANCE_API_SECRET = 'your_mainnet_api_secret'
-```
-
-4. **Configure trading settings**
-```python
-# Edit trading-bot/config.py
-LEVERAGE = 10                    # Futures leverage
-MARGIN_PER_TRADE = 100           # USDT per trade
-TELEGRAM_ENABLED = True          # Enable notifications
-```
-
-5. **Run the bot**
-```bash
-# For testnet (recommended for testing)
-cd trading-bot
-python main.py --testnet
-
-# For mainnet (real trading)
-python main.py
-```
-
-## ⚙️ Configuration
-
-### Choose Your Mode
-Edit `trading-bot/environment.py`:
-```python
-USE_TESTNET = True  # Start here! Switch to False when ready for real money
-```
-
-### Set Your Risk
-Edit `trading-bot/config.py`:
-```python
-ACTIVE_COINS = ['BTCUSDT', 'ETHUSDT', ...]  # Pick your coins
-LEVERAGE = 10                                # 10x is what I tested with
-MARGIN_PER_TRADE = 100                      # $100 per trade
-MAX_DAILY_TRADES = 50                       # Stop after 50 trades/day
-```
-
-### Get Notifications (Optional)
-**Telegram:** Message @BotFather, create a bot, get your chat ID from @userinfobot
-
-**Discord:** Right-click your channel → Integrations → Webhooks → Create
-
-## 📈 How the Optimization Works
-
-1. **Data**: 13 months of 1-minute candles for each coin
-
-2. **Indicators**: 14 technical indicators calculated - RSI, MACD, Bollinger Bands, EMA crossovers, volume analysis, etc.
-
-3. **CMA-ES Algorithm**: Evolutionary optimization over 100+ generations to find optimal indicator weights and parameters
-
-4. **Backtesting**: Includes Binance fees (0.04%), slippage (0.03%), and spread (0.01%)
-
-### Optimization Hardware Requirements
-
-**Recommended**: Google Colab Pro with v5e-1 TPU runtime (96 cores, 300+ GB RAM) for fast optimization
-
-**Alternative**: Any system with 8+ CPU cores and 16GB+ RAM (will take longer)
-
-The optimization uses parallel processing - more cores = faster results. On Colab Pro with TPU runtime, each coin optimizes in 5-6 hours. On a regular 4-core laptop, expect 18-22 hours per coin.
-
-### Signal Generation
-
-```python
-# Each indicator produces a signal between -1 and +1
-# Signals are weighted and combined
-Total Signal = Σ(Indicator Signal × Optimized Weight)
-
-if Total Signal > Entry Threshold:
-    Open LONG
-elif Total Signal < -Entry Threshold:
-    Open SHORT
-```
-
-## 🔄 Trading Logic
-
-### Entry:
-- Combined signal exceeds threshold
-- No existing position for that coin
-- Daily loss limit not reached
-
-### Exit:
-- Take profit reached
-- Stop loss triggered
-- Maximum holding time exceeded
-
-## 📊 Performance Tracking
-
-All trades are logged to SQLite database:
-- Entry/exit prices and times
-- Profit/loss per trade
-- Win rates and statistics
-- Signal strength at entry
-
-## 🚀 Deployment
-
-### Local/VPS
-```bash
-# Using screen for persistent sessions
-screen -S trading-bot
-python trading-bot/main.py
-# Ctrl+A+D to detach
-```
-
-### AWS EC2
-- Use t2.micro (free tier)
-- Ubuntu 22.04 recommended
-- Run with screen or systemd
-
-### Docker
-```bash
-docker build -t trading-bot .
-docker run -d trading-bot
-```
-
-## 🔒 Security
-
-- Never commit API keys to git
-- Test on testnet before mainnet
-- Use stop losses (automated)
-- Monitor trades via notifications
-- Secure your server properly
-
-## 🧪 Testing
-
-### Run optimization
-```bash
-python optimization.py
-# Note: Use Google Colab Pro with v5e-1 TPU for best performance
-# Or run on a system with 8+ CPU cores
-```
-
-### Testnet trading
-```bash
-cd trading-bot
-python main.py --testnet
-```
-
-## ⚠️ Disclaimer
-
-**EDUCATIONAL PURPOSE ONLY**
-
-This software is for learning algorithmic trading. The optimization results shown are from historical backtesting.
-
-- No responsibility for financial losses
-- Cryptocurrency trading carries high risk
-- Past performance doesn't guarantee future results
-- Only trade with money you can afford to lose
-
-By using this software, you accept all risks and responsibility for your trading decisions.
-
-## 📝 Contributing
-
-Contributions welcome. Fork the repo and submit a pull request.
-
-## 📜 License
-
-This project is licensed under the MIT License with additional disclaimers - see [LICENSE](LICENSE) file for details.
-
-## 🙏 Credits
-
-- Binance API
-- CMA-ES algorithm
-- Open source Python community
-
-## 📧 Support
-
-For questions or issues: [GitHub Issues](https://github.com/utkarsh-goel-21/crypto-futures-trading-bot/issues)
+- **SPY bias refresh**: cached for 24 hours in `spy_regime_cache.json`
+- **Entry timing**: pending signal on one candle, execution on the next candle close
+- **Exit orders**: TP/SL are placed as Binance Futures conditional algo orders
+- **Positions**: one position per coin at a time
+- **Mode toggle**: controlled by `trading-bot/environment.py`
+- **Copy trading**: follower accounts can mirror master entries and exits from the monitor UI
 
 ---
 
-⭐ **If you find this useful, please star the repository**
+## Notes
 
-*August 2025*
+- The SPY integration expects a compatible `spy-predictor` checkout to be reachable from this repo's parent directory tree.
+- The live bot and the optimizer are not identical today: the live bot uses the SPY daily gate, while the optimizer does not.
+- The monitor is meant for local operation and lightweight control, not hardened production deployment.
+- Testnet is strongly recommended before switching to mainnet.
+
+---
+
+## Disclaimer
+
+This project is for educational and research purposes only. Crypto futures trading is high risk, leverage magnifies losses, and historical optimization results do not guarantee future performance. Use testnet first and never trade with money you cannot afford to lose.
