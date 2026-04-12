@@ -23,6 +23,10 @@ class SpyRegimeFilter:
         self.cache_ttl_seconds = cache_ttl_seconds
         self.cache_path = self.project_root / "spy_regime_cache.json"
         self._memory_cache = None
+        self.file_cache_enabled = not any(
+            os.getenv(name)
+            for name in ("RENDER", "RENDER_SERVICE_ID", "RENDER_EXTERNAL_URL")
+        )
 
     def _find_spy_project_root(self) -> Path:
         candidates = []
@@ -49,6 +53,8 @@ class SpyRegimeFilter:
     def _load_cache(self) -> Optional[Dict[str, Any]]:
         if self._memory_cache:
             return self._memory_cache
+        if not self.file_cache_enabled:
+            return None
         if not self.cache_path.exists():
             return None
         try:
@@ -60,8 +66,10 @@ class SpyRegimeFilter:
             return None
 
     def _save_cache(self, cache: Dict[str, Any]) -> None:
-        self.cache_path.write_text(json.dumps(cache, indent=2))
         self._memory_cache = cache
+        if not self.file_cache_enabled:
+            return
+        self.cache_path.write_text(json.dumps(cache, indent=2))
 
     def _is_fresh(self, cache: Dict[str, Any]) -> bool:
         updated_at_epoch = cache.get("updated_at_epoch")

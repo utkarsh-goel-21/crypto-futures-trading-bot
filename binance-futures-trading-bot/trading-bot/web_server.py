@@ -31,7 +31,7 @@ if APP_ROOT is None:
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
-from config import DATABASE_FILE, LOG_FILE
+from config import DATABASE_ENABLED, DATABASE_FILE, LOG_FILE, LOG_TO_FILE
 from environment import USE_TESTNET
 from spy_integration import SpyRegimeFilter
 from runtime_config import get_binance_credentials
@@ -45,8 +45,8 @@ app = Flask(__name__)
 CORS(app)
 
 BOT_DIR = Path(__file__).resolve().parent
-DATABASE_PATH = BOT_DIR / DATABASE_FILE
-LOG_PATH = BOT_DIR / LOG_FILE
+DATABASE_PATH = (BOT_DIR / DATABASE_FILE) if DATABASE_FILE else None
+LOG_PATH = (BOT_DIR / LOG_FILE) if LOG_FILE else None
 ENVIRONMENT_LABEL = "TESTNET" if USE_TESTNET else "MAINNET"
 SELF_PING_URL = os.getenv("SELF_PING_URL", "https://crypto-futures-bot.onrender.com/health")
 SELF_PING_INTERVAL_SECONDS = 600
@@ -109,6 +109,19 @@ def init_binance_client():
         bot_data['logs'].append(f"[ERROR] Failed to initialize Binance client: {str(e)}")
         return False
 
+
+def stream_bot_output(process):
+    """Capture child bot stdout for in-memory UI logs and Render console logs."""
+    if process.stdout is None:
+        return
+
+    for raw_line in process.stdout:
+        line = raw_line.strip()
+        if not line:
+            continue
+        bot_data['logs'].append(line)
+        print(line, flush=True)
+
 def update_balance():
     """Update account balance"""
     global bot_data
@@ -143,6 +156,12 @@ def update_positions():
 def update_trade_stats():
     """Update trade statistics from database"""
     global bot_data
+    if not DATABASE_ENABLED or DATABASE_PATH is None:
+        bot_data['total_trades'] = 0
+        bot_data['wins'] = 0
+        bot_data['losses'] = 0
+        bot_data['win_rate'] = 0
+        return
     try:
         if DATABASE_PATH.exists():
             conn = sqlite3.connect(DATABASE_PATH)
@@ -194,6 +213,8 @@ def monitor_bot_logs():
     global bot_data, log_file_offset
 
     try:
+        if not LOG_TO_FILE or LOG_PATH is None:
+            return
         if not LOG_PATH.exists():
             return
 
@@ -240,13 +261,26 @@ def start_bot():
     global bot_process
     try:
         if bot_process is None or bot_process.poll() is not None:
-            bot_process = subprocess.Popen(
-                [sys.executable, "main.py"],
-                cwd=BOT_DIR,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
+            popen_kwargs = {
+                "args": [sys.executable, "main.py"],
+                "cwd": BOT_DIR,
+                "stderr": subprocess.STDOUT,
+                "text": True,
+            }
+            if LOG_TO_FILE:
+                popen_kwargs["stdout"] = subprocess.DEVNULL
+            else:
+                popen_kwargs["stdout"] = subprocess.PIPE
+                popen_kwargs["bufsize"] = 1
+
+            bot_process = subprocess.Popen(**popen_kwargs)
+
+            if not LOG_TO_FILE:
+                threading.Thread(
+                    target=stream_bot_output,
+                    args=(bot_process,),
+                    daemon=True,
+                ).start()
 
             bot_data['logs'].append("[INFO] Trading bot started")
             return True

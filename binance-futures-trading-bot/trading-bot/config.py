@@ -6,7 +6,7 @@ WITH TESTNET/MAINNET SUPPORT
 """
 
 # Import environment setting
-from environment import USE_TESTNET
+from environment import ENABLE_RUNTIME_FILES, USE_TESTNET
 
 # ========================================
 # ACTIVE COINS TO TRADE
@@ -82,6 +82,10 @@ MIN_BALANCE_TO_TRADE = 20  # Stop if balance < $50 USDT
 LOG_TRADES = True
 LOG_FILE = 'bot_trades.log'
 DATABASE_FILE = 'trades.db'
+LOG_TO_FILE = ENABLE_RUNTIME_FILES
+DATABASE_ENABLED = ENABLE_RUNTIME_FILES
+SPY_FILE_CACHE_ENABLED = ENABLE_RUNTIME_FILES
+FOLLOWERS_STORAGE_ENABLED = ENABLE_RUNTIME_FILES
 
 # Console output
 SHOW_INDICATORS = False  # Set True to see indicator values

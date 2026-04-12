@@ -4,11 +4,16 @@ import threading
 from datetime import datetime
 from binance.client import Client
 
+from config import FOLLOWERS_STORAGE_ENABLED
+
 FOLLOWERS_FILE = os.path.join(os.path.dirname(__file__), "followers.json")
 LOCK = threading.Lock()
+MEMORY_FOLLOWERS = {"followers": []}
 
 
 def _read_followers_file():
+    if not FOLLOWERS_STORAGE_ENABLED:
+        return {"followers": [dict(f) for f in MEMORY_FOLLOWERS["followers"]]}
     if not os.path.exists(FOLLOWERS_FILE):
         return {"followers": []}
     with open(FOLLOWERS_FILE, "r", encoding="utf-8") as f:
@@ -16,6 +21,9 @@ def _read_followers_file():
 
 
 def _write_followers_file(data):
+    if not FOLLOWERS_STORAGE_ENABLED:
+        MEMORY_FOLLOWERS["followers"] = [dict(f) for f in data.get("followers", [])]
+        return
     with open(FOLLOWERS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 

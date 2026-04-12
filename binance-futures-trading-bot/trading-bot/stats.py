@@ -8,7 +8,7 @@ Uses UTC timestamps consistently with the rest of the bot
 import sqlite3
 import logging
 from datetime import datetime, timedelta, timezone
-from config import DATABASE_FILE
+from config import DATABASE_ENABLED, DATABASE_FILE
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +24,19 @@ class StatsTracker:
     
     def get_stats(self, days=30):
         """Get statistics without sensitive financial data"""
+        if not DATABASE_ENABLED:
+            return {
+                'total_trades': 0,
+                'wins': 0,
+                'losses': 0,
+                'win_rate': 0,
+                'today_trades': 0,
+                'today_wins': 0,
+                'today_losses': 0,
+                'today_win_rate': 0,
+                'best_streak': 0,
+                'current_streak': 0
+            }
         try:
             conn = sqlite3.connect(DATABASE_FILE)
             cursor = conn.cursor()

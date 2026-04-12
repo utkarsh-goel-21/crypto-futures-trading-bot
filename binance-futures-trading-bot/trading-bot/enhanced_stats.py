@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple
 import logging
 
+from config import DATABASE_ENABLED
+
 logger = logging.getLogger(__name__)
 
 class EnhancedStatsTracker:
@@ -25,6 +27,8 @@ class EnhancedStatsTracker:
         
     def init_database(self):
         """Initialize or upgrade database schema"""
+        if not DATABASE_ENABLED:
+            return
         try:
             conn = sqlite3.connect(self.database_file)
             cursor = conn.cursor()
@@ -74,6 +78,9 @@ class EnhancedStatsTracker:
     
     def record_trade(self, trade_data: Dict):
         """Record a completed trade with enhanced details"""
+        if not DATABASE_ENABLED:
+            self.update_session_stats(trade_data)
+            return
         try:
             conn = sqlite3.connect(self.database_file)
             cursor = conn.cursor()
@@ -138,6 +145,26 @@ class EnhancedStatsTracker:
     
     def get_coin_stats(self, coin: str, hours: int = 0) -> Dict:
         """Get statistics for a specific coin"""
+        if not DATABASE_ENABLED:
+            session_coin = self.current_session_stats['by_coin'].get(
+                coin,
+                {'wins': 0, 'losses': 0, 'total': 0, 'pnl': 0.0}
+            )
+            total = session_coin['total']
+            wins = session_coin['wins']
+            losses = session_coin['losses']
+            return {
+                'coin': coin,
+                'total_trades': total,
+                'wins': wins,
+                'losses': losses,
+                'win_rate': (wins / total * 100) if total > 0 else 0,
+                'total_pnl': session_coin['pnl'],
+                'avg_win': 0,
+                'avg_loss': 0,
+                'best_trade': 0,
+                'worst_trade': 0
+            }
         try:
             conn = sqlite3.connect(self.database_file)
             cursor = conn.cursor()
@@ -204,6 +231,21 @@ class EnhancedStatsTracker:
     
     def get_overall_stats(self, hours: int = 0) -> Dict:
         """Get overall statistics across all coins"""
+        if not DATABASE_ENABLED:
+            overall = self.current_session_stats['overall']
+            total = overall['total']
+            wins = overall['wins']
+            losses = overall['losses']
+            return {
+                'total_trades': total,
+                'wins': wins,
+                'losses': losses,
+                'win_rate': (wins / total * 100) if total > 0 else 0,
+                'total_pnl': overall['pnl'],
+                'avg_win': 0,
+                'avg_loss': 0,
+                'active_coins': len(self.current_session_stats['by_coin'])
+            }
         try:
             conn = sqlite3.connect(self.database_file)
             cursor = conn.cursor()
@@ -265,6 +307,14 @@ class EnhancedStatsTracker:
     
     def get_all_coins_stats(self, hours: int = 0) -> List[Dict]:
         """Get stats for all coins that have trades"""
+        if not DATABASE_ENABLED:
+            stats = []
+            for coin in self.current_session_stats['by_coin']:
+                coin_stats = self.get_coin_stats(coin, hours)
+                if coin_stats['total_trades'] > 0:
+                    stats.append(coin_stats)
+            stats.sort(key=lambda x: x['win_rate'], reverse=True)
+            return stats
         try:
             conn = sqlite3.connect(self.database_file)
             cursor = conn.cursor()

@@ -80,22 +80,27 @@ if platform.system() == 'Windows':
 log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
 # Rotating file handler - 10MB per file, keep 5 files
-rotating_handler = RotatingFileHandler(
-    LOG_FILE, 
-    maxBytes=10*1024*1024,  # 10MB
-    backupCount=5,  # Keep 5 old files
-    encoding='utf-8'
-)
-rotating_handler.setFormatter(log_formatter)
+handlers = []
+
+if LOG_TO_FILE:
+    rotating_handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5,  # Keep 5 old files
+        encoding='utf-8'
+    )
+    rotating_handler.setFormatter(log_formatter)
+    handlers.append(rotating_handler)
 
 # Console handler
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(log_formatter)
+handlers.append(console_handler)
 
 # Configure root logger
 logging.basicConfig(
     level=logging.INFO,
-    handlers=[rotating_handler, console_handler]
+    handlers=handlers
 )
 
 logger = logging.getLogger(__name__)
@@ -144,6 +149,8 @@ def format_order_reference(order_ref):
 # ========================================
 def cleanup_old_trades(days_to_keep=30):
     """Remove trades older than specified days from database"""
+    if not DATABASE_ENABLED:
+        return
     try:
         conn = sqlite3.connect(DATABASE_FILE)
         cursor = conn.cursor()
@@ -182,6 +189,8 @@ def cleanup_old_trades(days_to_keep=30):
 
 def save_trade_to_db(trade_data):
     """Save trade to database with UTC timestamp"""
+    if not DATABASE_ENABLED:
+        return
     try:
         conn = sqlite3.connect(DATABASE_FILE)
         cursor = conn.cursor()

@@ -15,10 +15,17 @@ def _get_bool_env(name, default):
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
+
+IS_RENDER = any(
+    os.getenv(name)
+    for name in ("RENDER", "RENDER_SERVICE_ID", "RENDER_EXTERNAL_URL")
+)
+
 # ============================================
 # CHANGE THIS TO SWITCH BETWEEN TESTNET AND MAINNET
 # ============================================
 USE_TESTNET = _get_bool_env("USE_TESTNET", True)  # Set to False for real trading
+ENABLE_RUNTIME_FILES = _get_bool_env("ENABLE_RUNTIME_FILES", not IS_RENDER)
 
 # Display current mode
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
