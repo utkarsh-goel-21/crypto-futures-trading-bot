@@ -45,13 +45,13 @@ if str(PROJECT_ROOT) not in sys.path:
 from config import *
 from environment import USE_TESTNET
 from spy_integration import SpyRegimeFilter
+from runtime_config import (
+    TESTNET_BASE_URL,
+    TESTNET_FUTURES_URL,
+    get_binance_credentials,
+)
 
-# Import appropriate API keys based on environment
-if USE_TESTNET:
-    from apikey_testnet import testnet_api_key as api_key, testnet_secret_key as secret_key
-    from apikey_testnet import TESTNET_BASE_URL, TESTNET_FUTURES_URL
-else:
-    from apikey import api_key, secret_key
+api_key, secret_key = get_binance_credentials(USE_TESTNET)
     
 from indicators import IndicatorCalculator
 from telegram_notifier import notifier

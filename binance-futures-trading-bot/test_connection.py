@@ -14,7 +14,7 @@ sys.path.insert(0, bot_dir)
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from environment import USE_TESTNET
-from apikey_testnet import testnet_api_key as api_key, testnet_secret_key as secret_key
+from runtime_config import TESTNET_BASE_URL, TESTNET_FUTURES_URL, get_binance_credentials
 
 def test_connection():
     print("=" * 60)
@@ -24,11 +24,12 @@ def test_connection():
     try:
         # Initialize client
         print("Initializing Binance client...")
+        api_key, secret_key = get_binance_credentials(USE_TESTNET)
 
         if USE_TESTNET:
             client = Client(api_key, secret_key, testnet=True)
-            client.API_URL = 'https://testnet.binance.vision/api'
-            client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi'
+            client.API_URL = TESTNET_BASE_URL
+            client.FUTURES_URL = TESTNET_FUTURES_URL
             print("Using TESTNET")
         else:
             print("ERROR: Not in testnet mode!")

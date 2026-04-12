@@ -33,14 +33,12 @@ if str(APP_ROOT) not in sys.path:
 from config import DATABASE_FILE, LOG_FILE
 from environment import USE_TESTNET
 from spy_integration import SpyRegimeFilter
-
-if USE_TESTNET:
-    from apikey_testnet import testnet_api_key as api_key, testnet_secret_key as secret_key
-else:
-    from apikey import api_key, secret_key
+from runtime_config import get_binance_credentials
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
+
+api_key, secret_key = get_binance_credentials(USE_TESTNET)
 
 app = Flask(__name__)
 CORS(app)

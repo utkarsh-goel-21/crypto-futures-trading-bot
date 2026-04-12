@@ -14,6 +14,8 @@ import webbrowser
 import socket
 from pathlib import Path
 
+from runtime_config import TESTNET_BASE_URL, TESTNET_FUTURES_URL, get_binance_credentials
+
 def check_port(port):
     """Check if a port is available"""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -60,17 +62,17 @@ def check_api_keys():
 
     if USE_TESTNET:
         try:
-            from apikey_testnet import testnet_api_key, testnet_secret_key
-            if testnet_api_key and 'YOUR_' not in testnet_api_key:
+            testnet_api_key, testnet_secret_key = get_binance_credentials(USE_TESTNET)
+            if testnet_api_key and testnet_secret_key and 'YOUR_' not in testnet_api_key:
                 print(f"  ✅ Testnet API keys configured")
                 print(f"     Key: {testnet_api_key[:10]}...")
                 return True
             else:
                 print("  ❌ Testnet API keys not configured!")
-                print("     Please update apikey_testnet.py with your keys")
+                print("     Set BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_SECRET_KEY")
                 return False
-        except ImportError:
-            print("  ❌ apikey_testnet.py not found!")
+        except Exception as exc:
+            print(f"  ❌ Testnet credentials not available: {exc}")
             return False
     else:
         print("  ⚠️  WARNING: Running in MAINNET mode!")
@@ -86,11 +88,11 @@ def test_binance_connection():
     try:
         from binance.client import Client
         from environment import USE_TESTNET
-        from apikey_testnet import testnet_api_key as api_key, testnet_secret_key as secret_key
+        api_key, secret_key = get_binance_credentials(USE_TESTNET)
 
         client = Client(api_key, secret_key, testnet=True)
-        client.API_URL = 'https://testnet.binance.vision/api'
-        client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi'
+        client.API_URL = TESTNET_BASE_URL
+        client.FUTURES_URL = TESTNET_FUTURES_URL
 
         # Quick ping test
         client.ping()
@@ -160,8 +162,8 @@ def main():
 
     if not check_api_keys():
         print("\n❌ Please configure your API keys first!")
-        print("\nEdit: binance-futures-trading-bot/trading-bot/apikey_testnet.py")
-        print("Add your testnet API key and secret key")
+        print("\nSet BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_SECRET_KEY")
+        print("or keep a local trading-bot/apikey_testnet.py for local runs")
         sys.exit(1)
 
     if not test_binance_connection():

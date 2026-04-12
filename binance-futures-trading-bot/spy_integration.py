@@ -1,19 +1,22 @@
 import json
 import logging
 import os
+import requests
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from runtime_config import get_spy_predictor_api_url
 
 LOGGER = logging.getLogger(__name__)
 SPY_RESULT_MARKER = "__SPY_REGIME_JSON__="
 
 
 class SpyRegimeFilter:
-    """Fetch and cache the daily SPY LSTM regime from the sibling spy-predictor project."""
+    """Fetch and cache the daily SPY LSTM regime from API or local sibling project."""
 
     def __init__(self, project_root: Path, cache_ttl_seconds: int = 24 * 60 * 60):
         self.project_root = Path(project_root).resolve()
@@ -66,7 +69,38 @@ class SpyRegimeFilter:
             return False
         return (time.time() - updated_at_epoch) < self.cache_ttl_seconds
 
-    def _refresh_regime(self) -> Dict[str, Any]:
+    def _refresh_regime_from_api(self, api_url: str) -> Dict[str, Any]:
+        response = requests.get(
+            f"{api_url}/predict",
+            timeout=120,
+            headers={"Connection": "close"},
+        )
+        response.raise_for_status()
+        result = response.json()
+
+        regime = {
+            "regime": "LONG_ONLY" if result["prediction"] == 1 else "SHORT_ONLY",
+            "prediction": result["prediction"],
+            "direction": result["direction"],
+            "confidence": result["confidence"],
+            "prob_up": result["prob_up"],
+            "prob_down": result["prob_down"],
+            "as_of_date": result.get("as_of_date"),
+            "predicting_for": result.get("predicting_for"),
+            "market_data_source": result.get("market_data_source", "unknown"),
+            "market_data_last_refreshed": result.get("market_data_last_refreshed"),
+            "market_data_status": result.get("market_data_status"),
+            "market_data_warning": result.get("market_data_warning"),
+            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "source": "api",
+            "api_url": api_url,
+        }
+        regime["updated_at_epoch"] = time.time()
+        regime["cache_status"] = "fresh"
+        self._save_cache(regime)
+        return regime
+
+    def _refresh_regime_from_local_project(self) -> Dict[str, Any]:
         spy_root = self._find_spy_project_root()
         python_exec = self._get_spy_python(spy_root)
 
@@ -131,6 +165,12 @@ print("__SPY_REGIME_JSON__=" + json.dumps(payload))
                 return regime
 
         raise RuntimeError("SPY regime subprocess did not produce a parsable result.")
+
+    def _refresh_regime(self) -> Dict[str, Any]:
+        api_url = get_spy_predictor_api_url()
+        if api_url:
+            return self._refresh_regime_from_api(api_url)
+        return self._refresh_regime_from_local_project()
 
     def get_regime(self, force_refresh: bool = False) -> Dict[str, Any]:
         cache = self._load_cache()

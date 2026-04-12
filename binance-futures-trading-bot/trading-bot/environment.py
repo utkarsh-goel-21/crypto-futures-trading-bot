@@ -4,14 +4,23 @@ ENVIRONMENT CONFIGURATION
 Toggle between TESTNET and MAINNET here
 """
 
+import io
+import os
+import sys
+
+
+def _get_bool_env(name, default):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 # ============================================
 # CHANGE THIS TO SWITCH BETWEEN TESTNET AND MAINNET
 # ============================================
-USE_TESTNET = True  # Set to False for real trading
+USE_TESTNET = _get_bool_env("USE_TESTNET", True)  # Set to False for real trading
 
 # Display current mode
-import sys
-import io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 if USE_TESTNET:
