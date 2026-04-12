@@ -16,6 +16,7 @@ KEY CHANGES FROM ORIGINAL:
 import json
 import time
 import logging
+import re
 from logging.handlers import RotatingFileHandler
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,7 @@ import platform
 import asyncio
 from pathlib import Path
 
+from binance import ThreadedWebsocketManager
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from decimal import Decimal, ROUND_DOWN
@@ -104,6 +106,19 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+RATE_LIMIT_BAN_UNTIL_RE = re.compile(r"banned until (\d+)")
+
+
+def is_rate_limit_error(exc):
+    message = str(exc)
+    return "code=-1003" in message or "Too many requests" in message or "banned until" in message
+
+
+def parse_rate_limit_retry_at(exc):
+    match = RATE_LIMIT_BAN_UNTIL_RE.search(str(exc))
+    if not match:
+        return None
+    return (int(match.group(1)) / 1000.0) + 1
 
 
 def serialize_order_reference(order_response):
@@ -300,6 +315,7 @@ class CoinManager:
         self.entry_df = None  # Store entry timeframe data
         self.trend_df = None  # Store trend timeframe data
         self.candle_closed = {'entry': False, 'trend': False}  # Track closed candles
+        self.data_lock = threading.Lock()
         
         # Extract timeframes
         tf_combo = TIMEFRAME_MAP[int(self.params['parameters']['timeframe_combo'])]
@@ -351,6 +367,9 @@ class TradingBot:
         self.running = False
         self.account_balance = 0
         self.daily_pnl = 0
+        self.ws_manager = None
+        self.ws_streams = []
+        self.rest_backoff_until = 0.0
         
         # OPTIMIZATION ALIGNMENT: Pending signals for delayed execution
         self.pending_signals = {}  # {coin: {'signal': 'LONG/SHORT', 'strength': float, 'filters': dict}}
@@ -410,6 +429,90 @@ class TradingBot:
             regime.get('cache_status', 'unknown'),
         )
         return False
+
+    def note_rate_limit(self, source, exc, fallback_seconds=30):
+        """Record a temporary Binance REST backoff window after a rate-limit error."""
+        retry_at = parse_rate_limit_retry_at(exc) or (time.time() + fallback_seconds)
+        self.rest_backoff_until = max(self.rest_backoff_until, retry_at)
+        retry_dt = datetime.fromtimestamp(self.rest_backoff_until, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        logger.warning(f"⚠️ Binance REST backoff after {source} until {retry_dt}: {exc}")
+
+    def rest_backoff_active(self):
+        """Whether Binance REST calls should currently be skipped."""
+        return time.time() < self.rest_backoff_until
+
+    def load_initial_candle_buffers(self):
+        """Fetch initial history once, then keep the buffers live via WebSocket candle closes."""
+        logger.info("📚 Loading initial candle buffers for indicator calculations...")
+        loaded_pairs = 0
+
+        for coin, manager in self.coin_managers.items():
+            buffers = {}
+            for timeframe in {manager.entry_timeframe, manager.trend_timeframe}:
+                df = None
+                for attempt in range(1, 4):
+                    df = manager.indicator_calc.fetch_historical_data(
+                        self.client,
+                        timeframe,
+                        limit=CANDLES_REQUIRED,
+                    )
+                    if df is not None and len(df) >= 2:
+                        df = df.tail(CANDLES_REQUIRED).copy()
+                        break
+
+                    wait_seconds = max(API_DELAY, 0.5) * attempt
+                    logger.warning(
+                        f"⚠️ Failed to load {coin} {timeframe} history (attempt {attempt}/3). "
+                        f"Retrying in {wait_seconds:.1f}s"
+                    )
+                    time.sleep(wait_seconds)
+
+                if df is None or len(df) < 2:
+                    raise RuntimeError(f"Unable to load initial candle history for {coin} {timeframe}")
+
+                buffers[timeframe] = df
+                loaded_pairs += 1
+                time.sleep(API_DELAY)
+
+            with manager.data_lock:
+                manager.entry_df = buffers[manager.entry_timeframe].copy()
+                manager.trend_df = buffers[manager.trend_timeframe].copy()
+
+        logger.info(f"✅ Loaded initial candle buffers for {loaded_pairs} symbol/timeframe pairs")
+
+    def upsert_closed_candle(self, df, kline):
+        """Insert or replace a closed candle in an in-memory dataframe."""
+        candle_time = pd.to_datetime(int(kline['t']), unit='ms')
+        candle_row = pd.DataFrame(
+            [{
+                'open': float(kline['o']),
+                'high': float(kline['h']),
+                'low': float(kline['l']),
+                'close': float(kline['c']),
+                'volume': float(kline['v']),
+            }],
+            index=[candle_time],
+        )
+
+        if df is None or df.empty:
+            updated = candle_row
+        else:
+            updated = pd.concat([df[df.index != candle_time], candle_row]).sort_index()
+
+        max_rows = CANDLES_REQUIRED + 5
+        if len(updated) > max_rows:
+            updated = updated.iloc[-max_rows:]
+
+        return updated
+
+    def update_candle_buffers(self, coin, timeframe, kline):
+        """Update cached indicator inputs from a closed WebSocket candle."""
+        manager = self.coin_managers[coin]
+        with manager.data_lock:
+            if timeframe == manager.entry_timeframe:
+                manager.entry_df = self.upsert_closed_candle(manager.entry_df, kline)
+            if timeframe == manager.trend_timeframe:
+                manager.trend_df = self.upsert_closed_candle(manager.trend_df, kline)
     
     def load_coins(self):
         """Load all coin configurations"""
@@ -738,14 +841,20 @@ class TradingBot:
         lookup_params = self.resolve_order_lookup_params(coin, order_id)
         if not lookup_params:
             return 'MISSING'
+
+        if self.rest_backoff_active():
+            return 'RATE_LIMITED'
         
         try:
             order = self.client.futures_get_order(**lookup_params)
             return order['status']
-        except:
+        except Exception as exc:
+            if is_rate_limit_error(exc):
+                self.note_rate_limit(f"order status check {coin}", exc)
+                return 'RATE_LIMITED'
             return 'UNKNOWN'
     
-    def check_signal_on_candle_close(self, coin):
+    def check_signal_on_candle_close(self, coin, execution_price=None):
         """
         OPTIMIZATION-ALIGNED VERSION: Implements 1-candle delay like backtest
         - Executes pending signals from previous candle at MARKET PRICE
@@ -759,23 +868,17 @@ class TradingBot:
         """
         try:
             manager = self.coin_managers[coin]
-            
-            # Fetch fresh historical data
-            entry_df = manager.indicator_calc.fetch_historical_data(
-                self.client, 
-                manager.entry_timeframe,
-                limit=200
-            )
-            trend_df = manager.indicator_calc.fetch_historical_data(
-                self.client,
-                manager.trend_timeframe,
-                limit=200
-            )
-            
-            if entry_df is None or trend_df is None:
+
+            with manager.data_lock:
+                if manager.entry_df is None or manager.trend_df is None:
+                    return
+                entry_df = manager.entry_df.copy()
+                trend_df = manager.trend_df.copy()
+
+            if len(entry_df) < 2 or len(trend_df) < 2:
                 return
             
-            # Calculate indicators on fresh data
+            # Calculate indicators on buffered data that is updated by WebSocket closes.
             entry_df = manager.indicator_calc.calculate_all_indicators(entry_df)
             trend_df = manager.indicator_calc.calculate_all_indicators(trend_df)
             
@@ -801,10 +904,8 @@ class TradingBot:
                 if self.account_balance >= MARGIN_PER_TRADE and \
                    self.position_tracker.total_positions() < MAX_TOTAL_POSITIONS:
                     
-                    # Get CURRENT MARKET PRICE for execution
-                    # This is equivalent to "next candle open" in backtesting
-                    ticker = self.client.futures_symbol_ticker(symbol=coin)
-                    market_price = float(ticker['price'])
+                    # Use the closed candle price delivered by the WebSocket event instead of a fresh REST ticker call.
+                    market_price = execution_price if execution_price is not None else float(entry_df.iloc[-1]['close'])
                     
                     logger.info(f"⏰ {coin} Executing PENDING signal: {signal} @ MARKET ${market_price:.2f} (Strength: {strength:.2f})")
                     
@@ -864,6 +965,21 @@ class TradingBot:
                 )
                 
                 if entry_order_ref:
+                    if not PAPER_TRADING and (not tp_order_ref or not sl_order_ref):
+                        logger.error(f"❌ {coin} entry is missing TP/SL protection. Closing the position immediately.")
+                        try:
+                            self.client.futures_create_order(
+                                symbol=coin,
+                                side='SELL' if signal == 'LONG' else 'BUY',
+                                type='MARKET',
+                                quantity=quantity,
+                                reduceOnly=True
+                            )
+                            logger.info(f"✅ Closed unprotected {coin} entry immediately")
+                        except Exception as protection_error:
+                            logger.error(f"❌ Failed to close unprotected {coin} entry: {protection_error}")
+                        return
+
                     # Track position with all order IDs
                     self.position_tracker.add_position(coin, {
                         'side': signal,
@@ -953,6 +1069,9 @@ class TradingBot:
             
             # Check if both orders somehow disappeared (wait longer on testnet)
             missing_statuses = {'UNKNOWN', 'MISSING'}
+            if tp_status == 'RATE_LIMITED' or sl_status == 'RATE_LIMITED':
+                return None
+
             if tp_status in missing_statuses and sl_status in missing_statuses and not PAPER_TRADING:
                 # On testnet, give orders more time to appear (testnet is slower)
                 position_age = (datetime.now() - position.get('entry_time', datetime.now())).total_seconds()
@@ -1068,86 +1187,78 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Error handling exit for {coin}: {e}")
     
-    def start_polling(self):
-        """Start polling loop instead of WebSocket"""
-        logger.info("🌐 Starting polling mode (checking every 30 seconds)...")
+    def start_market_streams(self):
+        """Use WebSocket kline streams for candle-close detection."""
+        logger.info("🌐 Starting futures kline WebSocket streams...")
         logger.info("📊 NORMAL MODE - Exits on TP/SL only (matching optimization)")
-        
+
         self.running = True
-        
-        # Track last candle times to detect closes
         self.last_candles = {}
-        
-        # Initialize last candle times
+
         for coin, manager in self.coin_managers.items():
             self.last_candles[coin] = {
                 manager.entry_timeframe: None,
                 manager.trend_timeframe: None
             }
-        
-        # Start the polling loop in a separate thread
-        polling_thread = threading.Thread(target=self.polling_loop)
-        polling_thread.daemon = True
-        polling_thread.start()
-    
-    def polling_loop(self):
-        """Poll for candle closes every 30 seconds"""
-        while self.running:
-            try:
-                for coin, manager in self.coin_managers.items():
-                    # Check entry timeframe
-                    self.check_candle_close(coin, manager.entry_timeframe)
-                    
-                    # Check trend timeframe
-                    self.check_candle_close(coin, manager.trend_timeframe)
-                
-                # Wait 30 seconds before next check
-                time.sleep(30)
-                
-            except Exception as e:
-                logger.error(f"Error in polling loop: {e}")
-                time.sleep(30)
-    
-    def check_candle_close(self, coin, timeframe):
-        """
-        MODIFIED METHOD: Check if a candle has closed
-        Now checks signals on EVERY entry timeframe candle close
-        """
-        try:
-            manager = self.coin_managers[coin]
-            
-            # Fetch latest candle
-            klines = self.client.futures_klines(
-                symbol=coin,
-                interval=timeframe,
-                limit=2  # Get last 2 candles
-            )
-            
-            if not klines:
-                return
-            
-            # Get the last complete candle (not the current forming one)
-            last_complete = klines[-2]  # Second to last is complete
-            candle_time = last_complete[0]  # Timestamp
-            close_price = float(last_complete[4])  # Close price
-            
-            # Check if this is a new candle close
-            if self.last_candles[coin][timeframe] != candle_time:
-                # New candle closed!
-                self.last_candles[coin][timeframe] = candle_time
-                
-                logger.info(f"📊 {coin} {timeframe} candle closed at ${close_price:.2f}")
 
-                # Optional: Send to Telegram (you might want to comment this out to reduce spam)
-                notifier.send_message(f"📊 {coin} {timeframe} closed at ${close_price:.2f}")
-                
-                # Check signals on entry candle close
-                # Not just when no position exists
-                if timeframe == manager.entry_timeframe:
-                    self.check_signal_on_candle_close(coin)
-                    
+        self.ws_manager = ThreadedWebsocketManager(
+            api_key=api_key,
+            api_secret=secret_key,
+            testnet=USE_TESTNET,
+        )
+        self.ws_manager.start()
+
+        started = set()
+        for coin, manager in self.coin_managers.items():
+            for timeframe in {manager.entry_timeframe, manager.trend_timeframe}:
+                stream_key = (coin, timeframe)
+                if stream_key in started:
+                    continue
+                stream_name = self.ws_manager.start_kline_futures_socket(
+                    callback=self.handle_kline_message,
+                    symbol=coin,
+                    interval=timeframe,
+                )
+                self.ws_streams.append(stream_name)
+                started.add(stream_key)
+
+        logger.info("✅ WebSocket market streams active for %s symbol/timeframe pairs", len(started))
+
+    def handle_kline_message(self, msg):
+        """Handle futures kline messages from WebSocket streams."""
+        try:
+            if not isinstance(msg, dict):
+                return
+
+            if msg.get('e') == 'error':
+                logger.error(f"WebSocket error: {msg.get('type')} - {msg.get('m')}")
+                return
+
+            kline = msg.get('k')
+            if not kline or not kline.get('x'):
+                return
+
+            coin = msg.get('s') or msg.get('ps') or kline.get('s') or kline.get('ps')
+            timeframe = kline.get('i')
+            if not coin or not timeframe or coin not in self.coin_managers:
+                return
+
+            candle_time = kline.get('t')
+            close_price = float(kline.get('c', 0))
+            manager = self.coin_managers[coin]
+
+            if self.last_candles[coin].get(timeframe) == candle_time:
+                return
+
+            self.last_candles[coin][timeframe] = candle_time
+            self.update_candle_buffers(coin, timeframe, kline)
+            logger.info(f"📊 {coin} {timeframe} candle closed at ${close_price:.2f}")
+
+            if timeframe == manager.entry_timeframe:
+                self.check_signal_on_candle_close(coin, execution_price=close_price)
+
         except Exception as e:
-            logger.error(f"Error checking candle close for {coin} {timeframe}: {e}")
+            logger.error(f"Error handling kline message: {e}")
     
     def trading_loop(self):
         """Main trading loop - checks if TP/SL orders filled"""
@@ -1155,7 +1266,7 @@ class TradingBot:
         thresholds = ", ".join([f"{coin.replace('USDC','')}={manager.params['parameters']['entry_threshold']:.3f}" 
                                for coin, manager in self.coin_managers.items()])
         logger.info(f"   Entry thresholds: {thresholds}")
-        logger.info("⏳ Polling for candle closes every 30 seconds...")
+        logger.info("⏳ Waiting for WebSocket candle-close events...")
         logger.info("📊 TP/SL orders will be placed on Binance for instant execution")
         logger.info("📊 Positions exit on TP/SL only (no reversals)")
         
@@ -1190,12 +1301,13 @@ class TradingBot:
                         if exit_signal:
                             logger.info(f"✅ {coin} position closed: {exit_signal}")
                 
-                # Sleep before next iteration
-                time.sleep(5)  # Check order status every 5 seconds
+                # Sleep before next iteration.
+                # Binance already enforces TP/SL on-exchange, so local reconciliation does not need 5-second REST polling.
+                time.sleep(10)
                 
             except Exception as e:
                 logger.error(f"❌ Error in trading loop: {e}")
-                time.sleep(5)
+                time.sleep(10)
     
     def cleanup_open_orders(self):
         """Cancel all open TP/SL orders on shutdown"""
@@ -1233,9 +1345,11 @@ class TradingBot:
         logger.info(f"   Database Cleanup: Keeping last 30 days of trades")
         
         self.running = True
+
+        self.load_initial_candle_buffers()
         
-        # Start polling instead of WebSocket
-        self.start_polling()
+        # Start WebSocket market streams instead of REST polling
+        self.start_market_streams()
         
         # Wait for initial data
         logger.info("⏳ Waiting for initial data (10 seconds)...")
@@ -1248,6 +1362,11 @@ class TradingBot:
         """Stop the bot"""
         logger.info("🛑 Stopping bot...")
         self.running = False
+        if self.ws_manager is not None:
+            try:
+                self.ws_manager.stop()
+            except Exception as exc:
+                logger.warning(f"⚠️ Failed to stop WebSocket manager cleanly: {exc}")
         
         # Clean up open orders
         # self.cleanup_open_orders()

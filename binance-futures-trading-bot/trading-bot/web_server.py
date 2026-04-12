@@ -4,6 +4,7 @@ Provides API endpoints and serves frontend
 """
 
 import os
+import re
 import requests
 import sqlite3
 import subprocess
@@ -50,6 +51,8 @@ LOG_PATH = (BOT_DIR / LOG_FILE) if LOG_FILE else None
 ENVIRONMENT_LABEL = "TESTNET" if USE_TESTNET else "MAINNET"
 SELF_PING_URL = os.getenv("SELF_PING_URL", "https://crypto-futures-bot.onrender.com/health")
 SELF_PING_INTERVAL_SECONDS = 600
+ACCOUNT_REFRESH_SECONDS = 30
+RATE_LIMIT_BAN_UNTIL_RE = re.compile(r"banned until (\d+)")
 
 # Global variables for storing bot data
 bot_data = {
@@ -73,6 +76,28 @@ client = None
 bot_process = None
 spy_regime_filter = SpyRegimeFilter(APP_ROOT)
 log_file_offset = 0
+monitor_next_account_refresh_at = 0.0
+monitor_rate_limit_until = 0.0
+
+
+def is_rate_limit_error(exc):
+    message = str(exc)
+    return "code=-1003" in message or "Too many requests" in message or "banned until" in message
+
+
+def parse_rate_limit_retry_at(exc):
+    match = RATE_LIMIT_BAN_UNTIL_RE.search(str(exc))
+    if not match:
+        return None
+    return (int(match.group(1)) / 1000.0) + 1
+
+
+def note_monitor_rate_limit(exc, source):
+    global monitor_rate_limit_until
+    retry_at = parse_rate_limit_retry_at(exc) or (time.time() + 60)
+    monitor_rate_limit_until = max(monitor_rate_limit_until, retry_at)
+    retry_dt = datetime.fromtimestamp(monitor_rate_limit_until).strftime("%Y-%m-%d %H:%M:%S")
+    bot_data['logs'].append(f"[WARN] Binance monitor backoff after {source} until {retry_dt}: {exc}")
 
 
 def start_self_ping():
@@ -104,6 +129,7 @@ def init_binance_client():
             client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi'
         else:
             client = Client(api_key, secret_key)
+        refresh_account_snapshot(force=True)
         return True
     except Exception as e:
         bot_data['logs'].append(f"[ERROR] Failed to initialize Binance client: {str(e)}")
@@ -122,36 +148,55 @@ def stream_bot_output(process):
         bot_data['logs'].append(line)
         print(line, flush=True)
 
-def update_balance():
-    """Update account balance"""
-    global bot_data
-    try:
-        if client:
-            account = client.futures_account()
-            bot_data['balance'] = float(account['totalWalletBalance'])
-            bot_data['pnl'] = float(account.get('totalUnrealizedProfit', 0))
-    except Exception as e:
-        bot_data['logs'].append(f"[ERROR] Failed to update balance: {str(e)}")
+def refresh_account_snapshot(force=False):
+    """Refresh balance and positions with lighter Binance endpoints and rate-limit backoff."""
+    global bot_data, monitor_next_account_refresh_at
 
-def update_positions():
-    """Update active positions"""
-    global bot_data
+    if not client:
+        return
+
+    now = time.time()
+    if not force:
+        if now < monitor_rate_limit_until:
+            return
+        if now < monitor_next_account_refresh_at:
+            return
+
     try:
-        if client:
-            positions = client.futures_account()['positions']
-            active_positions = []
-            for pos in positions:
-                if float(pos['positionAmt']) != 0:
-                    active_positions.append({
-                        'symbol': pos['symbol'],
-                        'amount': float(pos['positionAmt']),
-                        'entry_price': float(pos['entryPrice']),
-                        'pnl': float(pos['unrealizedProfit']),
-                        'side': 'LONG' if float(pos['positionAmt']) > 0 else 'SHORT'
-                    })
-            bot_data['active_trades'] = active_positions
-    except Exception as e:
-        bot_data['logs'].append(f"[ERROR] Failed to update positions: {str(e)}")
+        balances = client.futures_account_balance()
+        positions = client.futures_position_information()
+
+        total_balance = bot_data['balance']
+        for asset in balances:
+            if asset.get('asset') == 'USDT':
+                total_balance = float(asset.get('balance', 0))
+                break
+
+        active_positions = []
+        total_unrealized = 0.0
+        for pos in positions:
+            amount = float(pos.get('positionAmt', 0))
+            unrealized = float(pos.get('unRealizedProfit', 0))
+            total_unrealized += unrealized
+            if amount == 0:
+                continue
+            active_positions.append({
+                'symbol': pos['symbol'],
+                'amount': amount,
+                'entry_price': float(pos.get('entryPrice', 0)),
+                'pnl': unrealized,
+                'side': 'LONG' if amount > 0 else 'SHORT'
+            })
+
+        bot_data['balance'] = total_balance
+        bot_data['pnl'] = total_unrealized
+        bot_data['active_trades'] = active_positions
+        monitor_next_account_refresh_at = now + ACCOUNT_REFRESH_SECONDS
+    except Exception as exc:
+        if is_rate_limit_error(exc):
+            note_monitor_rate_limit(exc, "account snapshot")
+            return
+        bot_data['logs'].append(f"[ERROR] Failed to refresh account snapshot: {str(exc)}")
 
 def update_trade_stats():
     """Update trade statistics from database"""
@@ -245,8 +290,7 @@ def update_loop():
     """Background thread to update data"""
     while True:
         try:
-            update_balance()
-            update_positions()
+            refresh_account_snapshot()
             update_trade_stats()
             update_spy_regime()
             monitor_bot_logs()
