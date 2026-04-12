@@ -663,6 +663,49 @@ class TradingBot:
             return {'symbol': coin, 'orderId': int(order_ref)}
 
         return None
+
+    def order_matches_reference(self, order_ref, order_payload):
+        """Check whether a Binance order payload matches a stored order reference."""
+        if not order_ref or not order_payload:
+            return False
+
+        if isinstance(order_ref, str):
+            if order_ref.startswith('oid:'):
+                return str(order_payload.get('orderId')) == order_ref.split(':', 1)[1]
+            if order_ref.startswith('aid:'):
+                return str(order_payload.get('algoId')) == order_ref.split(':', 1)[1]
+            if order_ref.startswith('cid:'):
+                return str(order_payload.get('clientOrderId')) == order_ref.split(':', 1)[1]
+            if order_ref.startswith('caid:'):
+                return str(order_payload.get('clientAlgoId')) == order_ref.split(':', 1)[1]
+            if order_ref.isdigit():
+                return str(order_payload.get('orderId')) == order_ref
+
+        return False
+
+    def lookup_conditional_order_status(self, coin, order_ref):
+        """Fallback lookup for TP/SL conditional orders when direct query does not find them."""
+        try:
+            open_orders = self.client.futures_get_open_orders(symbol=coin, conditional=True)
+            for order in open_orders:
+                if self.order_matches_reference(order_ref, order):
+                    return order.get('status', 'NEW')
+        except Exception as exc:
+            if is_rate_limit_error(exc):
+                self.note_rate_limit(f"conditional open orders {coin}", exc)
+                return 'RATE_LIMITED'
+
+        try:
+            all_orders = self.client.futures_get_all_orders(symbol=coin, conditional=True, limit=20)
+            for order in reversed(all_orders):
+                if self.order_matches_reference(order_ref, order):
+                    return order.get('status', 'UNKNOWN')
+        except Exception as exc:
+            if is_rate_limit_error(exc):
+                self.note_rate_limit(f"conditional all orders {coin}", exc)
+                return 'RATE_LIMITED'
+
+        return 'UNKNOWN'
     
     def close_position_market(self, coin, reason="SIGNAL_REVERSAL"):
         """
@@ -675,8 +718,8 @@ class TradingBot:
                 return False
                 
             # Cancel existing TP/SL orders first
-            self.cancel_order_safe(coin, position.get('tp_order_id'))
-            self.cancel_order_safe(coin, position.get('sl_order_id'))
+            self.cancel_order_safe(coin, position.get('tp_order_id'), conditional=True)
+            self.cancel_order_safe(coin, position.get('sl_order_id'), conditional=True)
             
             # Get current price for PnL calculation
             ticker = self.client.futures_symbol_ticker(symbol=coin)
@@ -813,11 +856,14 @@ class TradingBot:
             logger.error(f"❌ Failed to place orders for {coin}: {e}")
             return None, None, None
     
-    def cancel_order_safe(self, coin, order_id):
+    def cancel_order_safe(self, coin, order_id, conditional=False):
         """Safely cancel an order"""
         lookup_params = self.resolve_order_lookup_params(coin, order_id)
         if not lookup_params:
             return True
+
+        if conditional:
+            lookup_params = {**lookup_params, 'conditional': True}
         
         try:
             self.client.futures_cancel_order(**lookup_params)
@@ -830,7 +876,7 @@ class TradingBot:
             logger.error(f"❌ Failed to cancel order {format_order_reference(order_id)}: {e}")
             return False
     
-    def check_order_status(self, coin, order_id):
+    def check_order_status(self, coin, order_id, conditional=False):
         """Check if an order is filled"""
         if not order_id:
             return 'PAPER' if PAPER_TRADING else 'MISSING'
@@ -844,6 +890,9 @@ class TradingBot:
 
         if self.rest_backoff_active():
             return 'RATE_LIMITED'
+
+        if conditional:
+            lookup_params = {**lookup_params, 'conditional': True}
         
         try:
             order = self.client.futures_get_order(**lookup_params)
@@ -852,6 +901,8 @@ class TradingBot:
             if is_rate_limit_error(exc):
                 self.note_rate_limit(f"order status check {coin}", exc)
                 return 'RATE_LIMITED'
+            if conditional:
+                return self.lookup_conditional_order_status(coin, order_id)
             return 'UNKNOWN'
     
     def check_signal_on_candle_close(self, coin, execution_price=None):
@@ -1022,8 +1073,8 @@ class TradingBot:
             manager = self.coin_managers[coin]
             
             # Check TP order status
-            tp_status = self.check_order_status(coin, position.get('tp_order_id'))
-            sl_status = self.check_order_status(coin, position.get('sl_order_id'))
+            tp_status = self.check_order_status(coin, position.get('tp_order_id'), conditional=True)
+            sl_status = self.check_order_status(coin, position.get('sl_order_id'), conditional=True)
             
             # If in paper trading mode, check prices manually
             if PAPER_TRADING:
@@ -1053,7 +1104,7 @@ class TradingBot:
             if tp_status == 'FILLED':
                 logger.info(f"📊 {coin} TP Order Filled!")
                 # Cancel SL order
-                self.cancel_order_safe(coin, position.get('sl_order_id'))
+                self.cancel_order_safe(coin, position.get('sl_order_id'), conditional=True)
                 # Handle exit
                 self.handle_exit(coin, 'TP', position['tp_price'])
                 return 'TP'
@@ -1062,7 +1113,7 @@ class TradingBot:
             if sl_status == 'FILLED':
                 logger.info(f"📊 {coin} SL Order Filled!")
                 # Cancel TP order
-                self.cancel_order_safe(coin, position.get('tp_order_id'))
+                self.cancel_order_safe(coin, position.get('tp_order_id'), conditional=True)
                 # Handle exit
                 self.handle_exit(coin, 'SL', position['sl_price'])
                 return 'SL'
@@ -1318,11 +1369,11 @@ class TradingBot:
             if position:
                 # Cancel TP order
                 if position.get('tp_order_id'):
-                    self.cancel_order_safe(coin, position['tp_order_id'])
+                    self.cancel_order_safe(coin, position['tp_order_id'], conditional=True)
                 
                 # Cancel SL order
                 if position.get('sl_order_id'):
-                    self.cancel_order_safe(coin, position['sl_order_id'])
+                    self.cancel_order_safe(coin, position['sl_order_id'], conditional=True)
                 
                 logger.warning(f"⚠️ {coin} position still open at shutdown - orders cancelled")
     
