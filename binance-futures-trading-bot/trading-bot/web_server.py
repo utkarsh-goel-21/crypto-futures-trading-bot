@@ -4,6 +4,7 @@ Provides API endpoints and serves frontend
 """
 
 import os
+import requests
 import sqlite3
 import subprocess
 import sys
@@ -47,6 +48,8 @@ BOT_DIR = Path(__file__).resolve().parent
 DATABASE_PATH = BOT_DIR / DATABASE_FILE
 LOG_PATH = BOT_DIR / LOG_FILE
 ENVIRONMENT_LABEL = "TESTNET" if USE_TESTNET else "MAINNET"
+SELF_PING_URL = os.getenv("SELF_PING_URL", "https://crypto-futures-bot.onrender.com/health")
+SELF_PING_INTERVAL_SECONDS = 600
 
 # Global variables for storing bot data
 bot_data = {
@@ -70,6 +73,26 @@ client = None
 bot_process = None
 spy_regime_filter = SpyRegimeFilter(APP_ROOT)
 log_file_offset = 0
+
+
+def start_self_ping():
+    """Keep the web service warm independently of bot start/stop state."""
+    def ping_loop():
+        while True:
+            time.sleep(SELF_PING_INTERVAL_SECONDS)
+            try:
+                response = requests.get(SELF_PING_URL, timeout=30)
+                response.raise_for_status()
+                print(f"web self-ping ok: {SELF_PING_URL}", flush=True)
+            except Exception as exc:
+                print(f"web self-ping failed for {SELF_PING_URL}: {exc}", flush=True)
+
+    thread = threading.Thread(target=ping_loop, daemon=True)
+    thread.start()
+    print(
+        f"web self-ping enabled: {SELF_PING_URL} every {SELF_PING_INTERVAL_SECONDS}s",
+        flush=True,
+    )
 
 def init_binance_client():
     """Initialize Binance client"""
@@ -235,6 +258,15 @@ def start_bot():
 def index():
     """Serve the main page"""
     return render_template_string(HTML_TEMPLATE)
+
+@app.route('/health')
+def health():
+    """Lightweight health endpoint for Render and self-ping."""
+    return jsonify({
+        'status': 'ok',
+        'environment': ENVIRONMENT_LABEL,
+        'bot_status': bot_data.get('status', 'Unknown'),
+    })
 
 @app.route('/api/data')
 def get_data():
@@ -1489,6 +1521,8 @@ if __name__ == '__main__':
         bot_data['logs'].append("[INFO] Binance client initialized successfully")
     else:
         bot_data['logs'].append("[ERROR] Failed to initialize Binance client")
+
+    start_self_ping()
 
     # Start the bot automatically when server starts
     start_bot()
