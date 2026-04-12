@@ -49,7 +49,12 @@ BOT_DIR = Path(__file__).resolve().parent
 DATABASE_PATH = (BOT_DIR / DATABASE_FILE) if DATABASE_FILE else None
 LOG_PATH = (BOT_DIR / LOG_FILE) if LOG_FILE else None
 ENVIRONMENT_LABEL = "TESTNET" if USE_TESTNET else "MAINNET"
-SELF_PING_URL = os.getenv("SELF_PING_URL", "https://crypto-futures-bot.onrender.com/health")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+CONFIGURED_SELF_PING_URL = os.getenv("SELF_PING_URL", "").strip()
+if RENDER_EXTERNAL_URL:
+    SELF_PING_URL = f"{RENDER_EXTERNAL_URL}/health"
+else:
+    SELF_PING_URL = CONFIGURED_SELF_PING_URL or "http://127.0.0.1:5000/health"
 SELF_PING_INTERVAL_SECONDS = 600
 ACCOUNT_REFRESH_SECONDS = 30
 RATE_LIMIT_BAN_UNTIL_RE = re.compile(r"banned until (\d+)")
@@ -102,6 +107,13 @@ def note_monitor_rate_limit(exc, source):
 
 def start_self_ping():
     """Keep the web service warm independently of bot start/stop state."""
+    if RENDER_EXTERNAL_URL and CONFIGURED_SELF_PING_URL and CONFIGURED_SELF_PING_URL.rstrip("/") != SELF_PING_URL:
+        print(
+            f"web self-ping override ignored: SELF_PING_URL={CONFIGURED_SELF_PING_URL} "
+            f"does not match Render URL {SELF_PING_URL}",
+            flush=True,
+        )
+
     def ping_loop():
         while True:
             time.sleep(SELF_PING_INTERVAL_SECONDS)
