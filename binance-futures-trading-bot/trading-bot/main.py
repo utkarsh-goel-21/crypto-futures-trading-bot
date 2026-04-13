@@ -1653,7 +1653,96 @@ class TradingBot:
             
         except Exception as e:
             logger.error(f"Error handling exit for {coin}: {e}")
-    
+
+    def reconcile_exit_fill_from_user_stream(self, order):
+        """Close tracked positions immediately when a protective exit fill arrives on the private stream."""
+        try:
+            symbol = order.get('s')
+            position = self.position_tracker.get_position(symbol)
+            if not position:
+                return False
+
+            order_status = str(order.get('X') or order.get('x') or '').upper()
+            if order_status != 'FILLED':
+                return False
+
+            order_side = str(order.get('S') or '').upper()
+            expected_exit_side = 'SELL' if position['side'] == 'LONG' else 'BUY'
+            if order_side != expected_exit_side:
+                return False
+
+            order_type = str(order.get('o') or '').upper()
+            original_type = str(order.get('ot') or '').upper()
+            reduce_only = self.is_truthy_exchange_flag(order.get('R'))
+            close_position = self.is_truthy_exchange_flag(order.get('cp'))
+
+            # Ignore fills that do not look like protective or reducing exits.
+            if not (
+                order_type.startswith('TAKE_PROFIT')
+                or order_type.startswith('STOP')
+                or original_type.startswith('TAKE_PROFIT')
+                or original_type.startswith('STOP')
+                or reduce_only
+                or close_position
+            ):
+                return False
+
+            if order_type.startswith('TAKE_PROFIT') or original_type.startswith('TAKE_PROFIT'):
+                exit_type = 'TP'
+            elif order_type.startswith('STOP') or original_type.startswith('STOP'):
+                exit_type = 'SL'
+            else:
+                trigger_price = None
+                try:
+                    raw_trigger = order.get('sp')
+                    if raw_trigger not in (None, '', '0', '0.0', '0.000', '0.00000'):
+                        trigger_price = float(raw_trigger)
+                except (TypeError, ValueError):
+                    trigger_price = None
+
+                if trigger_price is not None:
+                    tp_distance = abs(trigger_price - float(position.get('tp_price', trigger_price)))
+                    sl_distance = abs(trigger_price - float(position.get('sl_price', trigger_price)))
+                    exit_type = 'TP' if tp_distance <= sl_distance else 'SL'
+                else:
+                    exit_type = 'MANUAL'
+
+            exit_price = None
+            for candidate in (order.get('ap'), order.get('L'), order.get('sp')):
+                if candidate in (None, '', '0', '0.0', '0.000', '0.00000'):
+                    continue
+                try:
+                    exit_price = float(candidate)
+                    break
+                except (TypeError, ValueError):
+                    continue
+
+            if exit_price is None or exit_price <= 0:
+                if exit_type == 'TP':
+                    exit_price = float(position.get('tp_price', position['entry_price']))
+                elif exit_type == 'SL':
+                    exit_price = float(position.get('sl_price', position['entry_price']))
+                else:
+                    exit_price = float(position['entry_price'])
+
+            sibling_order_ref = (
+                position.get('sl_order_id')
+                if exit_type == 'TP'
+                else position.get('tp_order_id')
+            )
+            if exit_type in {'TP', 'SL'} and sibling_order_ref:
+                self.cancel_order_safe(symbol, sibling_order_ref, conditional=True)
+
+            logger.info(
+                f"📊 {symbol} {exit_type} reconciled from private-stream fill @ ${exit_price:.2f}"
+            )
+            self.handle_exit(symbol, exit_type, exit_price)
+            return True
+
+        except Exception as exc:
+            logger.error(f"Error reconciling user-stream exit fill: {exc}")
+            return False
+
     def start_market_streams(self):
         """Use WebSocket kline streams for candle-close detection."""
         logger.info("🌐 Starting futures kline WebSocket streams...")
@@ -1737,6 +1826,8 @@ class TradingBot:
                 if order_status in {'FILLED', 'CANCELED', 'EXPIRED', 'REJECTED'}:
                     display_ref = references[0] if references else order_id
                     logger.info(f"📨 {symbol} order update {format_order_reference(display_ref)}: {order_status}")
+                    if order_status == 'FILLED':
+                        self.reconcile_exit_fill_from_user_stream(order)
 
             elif event_type == 'ACCOUNT_UPDATE':
                 account = msg.get('a', {})
