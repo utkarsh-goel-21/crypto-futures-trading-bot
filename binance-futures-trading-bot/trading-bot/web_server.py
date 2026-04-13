@@ -1561,7 +1561,7 @@ HTML_TEMPLATE = '''
     <script>
         let pendingBotAction = null;
         const IST_TIME_ZONE = 'Asia/Kolkata';
-        const LOG_TIMESTAMP_RE = /\b(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})(,\d{3})?\b/g;
+        const LOG_TIMESTAMP_RE = /([0-9]{4}-[0-9]{2}-[0-9]{2}) ([0-9]{2}:[0-9]{2}:[0-9]{2})(,[0-9]{3})?/g;
 
         function formatNumber(num) {
             if (num >= 1000) {
