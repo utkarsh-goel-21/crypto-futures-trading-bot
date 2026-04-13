@@ -1237,8 +1237,9 @@ HTML_TEMPLATE = '''
         }
 
         .side-short {
-            background: rgba(255, 75, 75, 0.2);
-            color: #FF4B4B;
+            color: var(--red);
+            background: rgba(255, 139, 139, 0.14);
+            border: 1px solid rgba(255, 139, 139, 0.24);
         }
 
         .position-details {

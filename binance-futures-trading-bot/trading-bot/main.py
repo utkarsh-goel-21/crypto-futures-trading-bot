@@ -456,6 +456,7 @@ class TradingBot:
 
         # Preload the daily SPY regime so entry gating uses a stable cached bias.
         self.log_active_spy_regime()
+        self.maybe_handle_startup_spy_bias_alignment()
 
     def log_active_spy_regime(self):
         """Log the currently active cached SPY regime."""
@@ -477,6 +478,14 @@ class TradingBot:
         except Exception as exc:
             logger.error(f"❌ Failed to load SPY regime on startup: {exc}")
 
+    def position_conflicts_with_regime(self, position_side, regime_name):
+        """Whether a tracked position is directionally against the active SPY regime."""
+        if regime_name == 'LONG_ONLY':
+            return position_side == 'SHORT'
+        if regime_name == 'SHORT_ONLY':
+            return position_side == 'LONG'
+        return False
+
     def calculate_unrealized_position_pnl(self, coin, position):
         """Calculate the latest unrealized PnL for one tracked position."""
         ticker = self.client.futures_symbol_ticker(symbol=coin)
@@ -490,6 +499,88 @@ class TradingBot:
 
         pnl_value = (pnl_pct / 100) * MARGIN_PER_TRADE
         return current_price, pnl_pct, pnl_value
+
+    def collect_active_basket_snapshots(self, active_positions):
+        """Capture a consistent unrealized PnL snapshot for all active positions."""
+        basket_snapshots = []
+        basket_pnl_value = 0.0
+
+        for coin, position in active_positions.items():
+            current_price, pnl_pct, pnl_value = self.calculate_unrealized_position_pnl(coin, position)
+            basket_snapshots.append({
+                'coin': coin,
+                'side': position['side'],
+                'current_price': current_price,
+                'pnl_pct': pnl_pct,
+                'pnl_value': pnl_value,
+            })
+            basket_pnl_value += pnl_value
+
+        return basket_snapshots, basket_pnl_value
+
+    def close_active_basket_for_spy_bias(self, basket_snapshots, basket_pnl_value, trigger_label):
+        """Close the currently tracked basket because the active SPY bias says to flatten risk."""
+        logger.warning(
+            "🧭 %s: closing %s active position(s) because basket unrealized PnL is positive ($%.2f)",
+            trigger_label,
+            len(basket_snapshots),
+            basket_pnl_value,
+        )
+
+        for snapshot in basket_snapshots:
+            coin = snapshot['coin']
+            if not self.position_tracker.has_position(coin):
+                continue
+
+            closed = self.close_position_market(coin, reason="BIAS_CHANGE")
+            if closed:
+                logger.info(
+                    "🧭 %s closed by SPY bias change @ $%.2f | unrealized snapshot: %.2f%% ($%.2f)",
+                    coin,
+                    snapshot['current_price'],
+                    snapshot['pnl_pct'],
+                    snapshot['pnl_value'],
+                )
+
+    def maybe_handle_startup_spy_bias_alignment(self):
+        """Run a one-time startup alignment check for restored positions against the active SPY regime."""
+        regime = self.active_spy_regime
+        if not regime:
+            return
+
+        active_positions = self.position_tracker.get_all_positions()
+        if not active_positions:
+            return
+
+        conflicting_positions = [
+            coin for coin, position in active_positions.items()
+            if self.position_conflicts_with_regime(position['side'], regime.get('regime'))
+        ]
+        if not conflicting_positions:
+            return
+
+        try:
+            basket_snapshots, basket_pnl_value = self.collect_active_basket_snapshots(active_positions)
+        except Exception as exc:
+            logger.error(f"❌ Failed to evaluate startup SPY bias alignment: {exc}")
+            return
+
+        logger.info(
+            "🧭 Startup SPY alignment check: regime=%s | conflicting positions=%s | active basket unrealized PnL=$%.2f",
+            regime.get('regime', 'unknown'),
+            ", ".join(conflicting_positions),
+            basket_pnl_value,
+        )
+
+        if basket_pnl_value <= 0:
+            logger.info("🧭 Startup SPY alignment close skipped because active basket unrealized PnL is not positive")
+            return
+
+        self.close_active_basket_for_spy_bias(
+            basket_snapshots,
+            basket_pnl_value,
+            "Startup SPY bias alignment triggered",
+        )
 
     def maybe_handle_spy_bias_change(self):
         """Close the current basket once when the daily SPY bias flips and basket PnL is positive."""
@@ -533,24 +624,18 @@ class TradingBot:
             logger.info("🧭 SPY bias changed but there are no active positions to review")
             return
 
-        basket_snapshots = []
-        basket_pnl_value = 0.0
-
         for coin, position in active_positions.items():
-            try:
-                current_price, pnl_pct, pnl_value = self.calculate_unrealized_position_pnl(coin, position)
-            except Exception as exc:
-                logger.error(f"❌ Failed to evaluate {coin} for SPY bias-change exit: {exc}")
-                return
+            if self.position_conflicts_with_regime(position['side'], current_regime.get('regime')):
+                break
+        else:
+            logger.info("🧭 SPY bias changed but active positions already align with the new regime")
+            return
 
-            basket_snapshots.append({
-                'coin': coin,
-                'side': position['side'],
-                'current_price': current_price,
-                'pnl_pct': pnl_pct,
-                'pnl_value': pnl_value,
-            })
-            basket_pnl_value += pnl_value
+        try:
+            basket_snapshots, basket_pnl_value = self.collect_active_basket_snapshots(active_positions)
+        except Exception as exc:
+            logger.error(f"❌ Failed to evaluate active basket for SPY bias change: {exc}")
+            return
 
         logger.info(
             "🧭 SPY bias flip detected: %s -> %s | active basket unrealized PnL: $%.2f across %s position(s)",
@@ -564,26 +649,11 @@ class TradingBot:
             logger.info("🧭 Bias-change close skipped because active basket unrealized PnL is not positive")
             return
 
-        logger.warning(
-            "🧭 Bias-change close triggered: closing %s active position(s) because basket unrealized PnL is positive ($%.2f)",
-            len(basket_snapshots),
+        self.close_active_basket_for_spy_bias(
+            basket_snapshots,
             basket_pnl_value,
+            "Bias-change close triggered",
         )
-
-        for snapshot in basket_snapshots:
-            coin = snapshot['coin']
-            if not self.position_tracker.has_position(coin):
-                continue
-
-            closed = self.close_position_market(coin, reason="BIAS_CHANGE")
-            if closed:
-                logger.info(
-                    "🧭 %s closed by SPY bias change @ $%.2f | unrealized snapshot: %.2f%% ($%.2f)",
-                    coin,
-                    snapshot['current_price'],
-                    snapshot['pnl_pct'],
-                    snapshot['pnl_value'],
-                )
 
     def is_signal_allowed_by_spy(self, coin, signal, phase):
         """Allow only trades aligned with the cached daily SPY regime."""
