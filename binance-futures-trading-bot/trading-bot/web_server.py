@@ -62,6 +62,19 @@ RATE_LIMIT_BAN_UNTIL_RE = re.compile(r"banned until (\d+)")
 TRADE_EXIT_RE = re.compile(
     r"Closed:\s+([A-Z_]+)\s+@\s+\$[-+]?\d+(?:\.\d+)?\s+\|\s+PnL:\s+([-+]?\d+(?:\.\d+)?)%"
 )
+POSITION_OPEN_RE = re.compile(
+    r"Position opened:\s+([A-Z]+)\s+-\s+(LONG|SHORT)\s+@\s+\$([0-9]+(?:\.\d+)?)"
+)
+POSITION_CLOSED_RE = re.compile(r"Position closed:\s+([A-Z]+)")
+RESTORED_POSITION_RE = re.compile(
+    r"Restored Binance position:\s+([A-Z]+)\s+-\s+(LONG|SHORT)\s+@\s+\$([0-9]+(?:\.\d+)?)\s+\|\s+qty=([0-9]+(?:\.\d+)?)"
+)
+ENTRY_ORDER_PLACED_RE = re.compile(
+    r"Entry order placed:\s+(BUY|SELL)\s+([0-9]+(?:\.\d+)?)\s+([A-Z]+)"
+)
+CANDLE_CLOSE_RE = re.compile(
+    r"([A-Z]+)\s+(?:1m|5m|15m|30m|1h|2h|4h)\s+candle closed at \$([0-9]+(?:\.\d+)?)"
+)
 
 # Global variables for storing bot data
 bot_data = {
@@ -96,11 +109,15 @@ bot_process = None
 spy_regime_filter = SpyRegimeFilter(APP_ROOT)
 log_file_offset = 0
 monitor_next_account_refresh_at = 0.0
+monitor_last_account_refresh_at = 0.0
 monitor_rate_limit_until = 0.0
 monitor_position_targets_cache = {}
 bot_session_started_at = None
 bot_session_start_balance = None
 bot_session_start_balance_pending = False
+log_tracked_positions = {}
+last_entry_order_details = {}
+latest_symbol_prices = {}
 
 
 def is_rate_limit_error(exc):
@@ -230,10 +247,126 @@ def record_trade_exit_from_log(line):
             live_trade_stats['losses'] += 1
 
 
+def record_position_state_from_log(line):
+    """Track open positions from bot logs so the dashboard survives snapshot gaps."""
+    candle_match = CANDLE_CLOSE_RE.search(line)
+    if candle_match:
+        latest_symbol_prices[candle_match.group(1)] = float(candle_match.group(2))
+
+    entry_order_match = ENTRY_ORDER_PLACED_RE.search(line)
+    if entry_order_match:
+        order_side = entry_order_match.group(1)
+        quantity = float(entry_order_match.group(2))
+        symbol = entry_order_match.group(3)
+        last_entry_order_details[symbol] = {
+            'amount': quantity if order_side == 'BUY' else -quantity,
+            'side': 'LONG' if order_side == 'BUY' else 'SHORT',
+            'updated_at': time.time(),
+        }
+
+    restored_match = RESTORED_POSITION_RE.search(line)
+    if restored_match:
+        symbol = restored_match.group(1)
+        side = restored_match.group(2)
+        entry_price = float(restored_match.group(3))
+        quantity = float(restored_match.group(4))
+        log_tracked_positions[symbol] = {
+            'symbol': symbol,
+            'side': side,
+            'entry_price': entry_price,
+            'amount': quantity if side == 'LONG' else -quantity,
+            'opened_at': time.time(),
+            'source': 'restored',
+        }
+        return
+
+    opened_match = POSITION_OPEN_RE.search(line)
+    if opened_match:
+        symbol = opened_match.group(1)
+        side = opened_match.group(2)
+        entry_price = float(opened_match.group(3))
+        order_details = last_entry_order_details.get(symbol, {})
+        amount = order_details.get('amount')
+        if amount is None:
+            amount = 1.0 if side == 'LONG' else -1.0
+        log_tracked_positions[symbol] = {
+            'symbol': symbol,
+            'side': side,
+            'entry_price': entry_price,
+            'amount': amount,
+            'opened_at': time.time(),
+            'source': 'log',
+        }
+        return
+
+    closed_match = POSITION_CLOSED_RE.search(line)
+    if closed_match:
+        symbol = closed_match.group(1)
+        log_tracked_positions.pop(symbol, None)
+        last_entry_order_details.pop(symbol, None)
+
+
+def build_log_fallback_positions():
+    """Build lightweight open positions from bot logs when exchange snapshots are unavailable."""
+    fallback_positions = []
+    total_unrealized = 0.0
+
+    for symbol, tracked in sorted(log_tracked_positions.items()):
+        entry_price = float(tracked.get('entry_price') or 0.0)
+        amount = float(tracked.get('amount') or 0.0)
+        side = tracked.get('side') or ('LONG' if amount >= 0 else 'SHORT')
+        latest_price = latest_symbol_prices.get(symbol)
+
+        pnl = 0.0
+        if latest_price and entry_price and amount:
+            quantity = abs(amount)
+            if side == 'LONG':
+                pnl = (latest_price - entry_price) * quantity
+            else:
+                pnl = (entry_price - latest_price) * quantity
+
+        cached_targets = monitor_position_targets_cache.get(symbol, {})
+        fallback_positions.append({
+            'symbol': symbol,
+            'amount': amount,
+            'entry_price': entry_price,
+            'pnl': pnl,
+            'side': side,
+            'tp_target': cached_targets.get('tp_target'),
+            'sl_target': cached_targets.get('sl_target'),
+            'source': 'log-fallback',
+        })
+        total_unrealized += pnl
+
+    return fallback_positions, total_unrealized
+
+
+def maybe_apply_log_position_fallback():
+    """Use log-derived positions when Binance snapshots are stale or temporarily blocked."""
+    if not log_tracked_positions:
+        active_trades = bot_data.get('active_trades') or []
+        if active_trades and all(pos.get('source') == 'log-fallback' for pos in active_trades):
+            bot_data['active_trades'] = []
+            bot_data['pnl'] = 0.0
+        return
+
+    fallback_positions, total_unrealized = build_log_fallback_positions()
+    if not fallback_positions:
+        return
+
+    snapshot_stale = (time.time() - monitor_last_account_refresh_at) > ACCOUNT_REFRESH_SECONDS
+    if bot_data.get('active_trades') and not snapshot_stale and time.time() >= monitor_rate_limit_until:
+        return
+
+    bot_data['active_trades'] = fallback_positions
+    bot_data['pnl'] = total_unrealized
+
+
 def append_bot_log_line(line):
     """Append a bot log line and update any in-memory derived dashboard stats."""
     bot_data['logs'].append(line)
     record_trade_exit_from_log(line)
+    record_position_state_from_log(line)
 
 
 def apply_live_trade_stats():
@@ -352,17 +485,20 @@ def stream_bot_output(process):
 
 def refresh_account_snapshot(force=False):
     """Refresh balance and positions with lighter Binance endpoints and rate-limit backoff."""
-    global bot_data, monitor_next_account_refresh_at, monitor_position_targets_cache
+    global bot_data, monitor_next_account_refresh_at, monitor_last_account_refresh_at, monitor_position_targets_cache
     global bot_session_start_balance, bot_session_start_balance_pending
 
     if not client:
+        maybe_apply_log_position_fallback()
         return
 
     now = time.time()
     if not force:
         if now < monitor_rate_limit_until:
+            maybe_apply_log_position_fallback()
             return
         if now < monitor_next_account_refresh_at:
+            maybe_apply_log_position_fallback()
             return
 
     try:
@@ -451,9 +587,11 @@ def refresh_account_snapshot(force=False):
             if symbol in active_symbols
         }
         monitor_next_account_refresh_at = now + ACCOUNT_REFRESH_SECONDS
+        monitor_last_account_refresh_at = now
     except Exception as exc:
         if is_rate_limit_error(exc):
             note_monitor_rate_limit(exc, "account snapshot")
+            maybe_apply_log_position_fallback()
             return
         append_bot_log_line(f"[ERROR] Failed to refresh account snapshot: {str(exc)}")
 
@@ -563,6 +701,7 @@ def update_loop():
             update_trade_stats()
             update_spy_regime()
             monitor_bot_logs()
+            maybe_apply_log_position_fallback()
             bot_data['last_update'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             bot_data['status'] = 'Running' if bot_process and bot_process.poll() is None else 'Stopped'
         except Exception as e:
@@ -619,6 +758,7 @@ def health():
 @app.route('/api/data')
 def get_data():
     """API endpoint for bot data"""
+    maybe_apply_log_position_fallback()
     # Convert deque to list for JSON serialization
     data = bot_data.copy()
     data['logs'] = list(bot_data['logs'])
