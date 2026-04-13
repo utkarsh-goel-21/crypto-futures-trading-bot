@@ -112,6 +112,65 @@ def note_monitor_rate_limit(exc, source):
     append_bot_log_line(f"[WARN] Binance monitor backoff after {source} until {retry_dt}: {exc}")
 
 
+def extract_order_type(order_payload):
+    """Read order type from either standard or algo/conditional futures order payloads."""
+    if not order_payload:
+        return None
+    return (
+        order_payload.get('type')
+        or order_payload.get('origType')
+        or order_payload.get('orderType')
+    )
+
+
+def extract_order_trigger_price(order_payload):
+    """Read trigger/stop price from either standard or algo/conditional futures order payloads."""
+    if not order_payload:
+        return None
+    raw_value = (
+        order_payload.get('stopPrice')
+        or order_payload.get('triggerPrice')
+        or order_payload.get('price')
+    )
+    if raw_value in (None, '', '0', '0.0', '0.000', '0.00000'):
+        return None
+    try:
+        return float(raw_value)
+    except (TypeError, ValueError):
+        return None
+
+
+def identify_monitor_protective_orders(position_side, open_orders):
+    """Pick TP and SL conditional orders for a visible exchange position."""
+    exit_side = 'SELL' if position_side == 'LONG' else 'BUY'
+    tp_order = None
+    sl_order = None
+
+    for order in sorted(
+        open_orders or [],
+        key=lambda item: (
+            int(item.get('updateTime') or item.get('time') or 0),
+            int(item.get('orderId') or item.get('algoId') or 0),
+        ),
+        reverse=True,
+    ):
+        order_side = str(order.get('side') or order.get('S') or '').upper()
+        order_type = str(extract_order_type(order) or '').upper()
+
+        if order_side != exit_side:
+            continue
+
+        if order_type.startswith('TAKE_PROFIT') and tp_order is None:
+            tp_order = order
+        elif order_type.startswith('STOP') and sl_order is None:
+            sl_order = order
+
+        if tp_order and sl_order:
+            break
+
+    return tp_order, sl_order
+
+
 def record_trade_exit_from_log(line):
     """Update in-memory dashboard counters from bot exit logs when DB persistence is disabled."""
     match = TRADE_EXIT_RE.search(line)
@@ -234,13 +293,36 @@ def refresh_account_snapshot(force=False):
             total_unrealized += unrealized
             if amount == 0:
                 continue
-            active_positions.append({
+            active_position = {
                 'symbol': pos['symbol'],
                 'amount': amount,
                 'entry_price': float(pos.get('entryPrice', 0)),
                 'pnl': unrealized,
-                'side': 'LONG' if amount > 0 else 'SHORT'
-            })
+                'side': 'LONG' if amount > 0 else 'SHORT',
+                'tp_target': None,
+                'sl_target': None,
+            }
+
+            try:
+                conditional_orders = client.futures_get_open_orders(
+                    symbol=pos['symbol'],
+                    conditional=True,
+                )
+                tp_order, sl_order = identify_monitor_protective_orders(
+                    active_position['side'],
+                    conditional_orders,
+                )
+                active_position['tp_target'] = extract_order_trigger_price(tp_order)
+                active_position['sl_target'] = extract_order_trigger_price(sl_order)
+            except Exception as exc:
+                if is_rate_limit_error(exc):
+                    note_monitor_rate_limit(exc, f"conditional snapshot {pos['symbol']}")
+                else:
+                    append_bot_log_line(
+                        f"[WARN] Failed to load TP/SL snapshot for {pos['symbol']}: {exc}"
+                    )
+
+            active_positions.append(active_position)
 
         bot_data['balance'] = total_balance
         bot_data['pnl'] = total_unrealized
@@ -1357,6 +1439,13 @@ HTML_TEMPLATE = '''
             return num.toFixed(2);
         }
 
+        function formatPriceValue(value) {
+            if (value === null || value === undefined || Number.isNaN(value)) {
+                return 'N/A';
+            }
+            return Number(value).toFixed(4);
+        }
+
         function setBotButtonState(currentStatus) {
             const startBtn = document.getElementById('start-bot-btn');
             const stopBtn = document.getElementById('stop-bot-btn');
@@ -1477,7 +1566,7 @@ HTML_TEMPLATE = '''
                 const positionsEl = document.getElementById('positions-list');
                 if (data.active_trades.length > 0) {
                     positionsEl.innerHTML = data.active_trades.map(pos => `
-                        <div class="position">
+                        <div class="position" title="TP: ${formatPriceValue(pos.tp_target)} | SL: ${formatPriceValue(pos.sl_target)}">
                             <div class="position-info">
                                 <span class="coin-symbol">${pos.symbol.replace('USDT', '')}</span>
                                 <span class="position-side ${pos.side === 'LONG' ? 'side-long' : 'side-short'}">${pos.side}</span>
