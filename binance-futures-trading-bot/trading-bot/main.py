@@ -390,11 +390,9 @@ class TradingBot:
         self.load_coins()
         self.load_symbol_exchange_rules()
         
-        # Check account
-        self.check_account()
-        
-        # Set up leverage and margin mode
-        self.setup_trading_params()
+        # Wait through startup-time Binance REST rate limits instead of exiting and
+        # forcing the web supervisor to be manually restarted later.
+        self.ensure_exchange_ready()
 
         # Preload the daily SPY regime so entry gating uses a stable cached bias.
         self.log_active_spy_regime()
@@ -446,6 +444,36 @@ class TradingBot:
     def rest_backoff_active(self):
         """Whether Binance REST calls should currently be skipped."""
         return time.time() < self.rest_backoff_until
+
+    def wait_for_rest_backoff(self, context):
+        """Sleep until the current Binance REST ban/backoff window expires."""
+        if not self.rest_backoff_active():
+            return
+        wait_seconds = max(1.0, self.rest_backoff_until - time.time())
+        logger.warning(
+            f"⚠️ Waiting {wait_seconds:.1f}s before {context} because Binance REST is rate-limited"
+        )
+        time.sleep(wait_seconds)
+
+    def ensure_exchange_ready(self):
+        """Block startup until account access and one-time exchange setup can succeed."""
+        while True:
+            self.wait_for_rest_backoff("checking Binance account")
+            if self.check_account(fatal=False):
+                break
+            if self.rest_backoff_active():
+                continue
+            logger.warning("⚠️ Binance account check failed during startup. Retrying in 10.0s")
+            time.sleep(10)
+
+        while True:
+            self.wait_for_rest_backoff("setting leverage and margin")
+            if self.setup_trading_params():
+                return
+            if self.rest_backoff_active():
+                continue
+            logger.warning("⚠️ Trading parameter setup failed during startup. Retrying in 10.0s")
+            time.sleep(10)
 
     def load_symbol_exchange_rules(self):
         """Cache Binance symbol filters once so order formatting is exact and REST-light."""
@@ -712,6 +740,8 @@ class TradingBot:
     def setup_trading_params(self):
         """Set leverage and margin mode for all coins"""
         for coin in ACTIVE_COINS:
+            if self.rest_backoff_active():
+                return False
             try:
                 # Set leverage
                 self.client.futures_change_leverage(symbol=coin, leverage=LEVERAGE)
@@ -726,7 +756,11 @@ class TradingBot:
                 logger.info(f"✅ {coin}: {LEVERAGE}X leverage, {MARGIN_TYPE} margin")
                 
             except Exception as e:
+                if is_rate_limit_error(e):
+                    self.note_rate_limit(f"setup trading params {coin}", e, fallback_seconds=60)
+                    return False
                 logger.error(f"❌ Failed to setup {coin}: {e}")
+        return True
     
     def calculate_position_size(self, coin, price):
         """Calculate position size for a coin"""
