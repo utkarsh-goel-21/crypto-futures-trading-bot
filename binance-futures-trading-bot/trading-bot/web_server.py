@@ -58,6 +58,7 @@ else:
 SELF_PING_INTERVAL_SECONDS = 600
 ACCOUNT_REFRESH_SECONDS = 30
 RATE_LIMIT_BAN_UNTIL_RE = re.compile(r"banned until (\d+)")
+TRADE_EXIT_RE = re.compile(r"Closed:\s+(TP|SL|MANUAL)\s+@")
 
 # Global variables for storing bot data
 bot_data = {
@@ -74,6 +75,12 @@ bot_data = {
     'environment': ENVIRONMENT_LABEL,
     'spy_regime': None,
     'spy_regime_error': None,
+}
+
+live_trade_stats = {
+    'tp': 0,
+    'sl': 0,
+    'manual': 0,
 }
 
 # Binance client
@@ -102,7 +109,42 @@ def note_monitor_rate_limit(exc, source):
     retry_at = parse_rate_limit_retry_at(exc) or (time.time() + 60)
     monitor_rate_limit_until = max(monitor_rate_limit_until, retry_at)
     retry_dt = datetime.fromtimestamp(monitor_rate_limit_until).strftime("%Y-%m-%d %H:%M:%S")
-    bot_data['logs'].append(f"[WARN] Binance monitor backoff after {source} until {retry_dt}: {exc}")
+    append_bot_log_line(f"[WARN] Binance monitor backoff after {source} until {retry_dt}: {exc}")
+
+
+def record_trade_exit_from_log(line):
+    """Update in-memory dashboard counters from bot exit logs when DB persistence is disabled."""
+    match = TRADE_EXIT_RE.search(line)
+    if not match:
+        return
+
+    exit_type = match.group(1)
+    if exit_type == 'TP':
+        live_trade_stats['tp'] += 1
+    elif exit_type == 'SL':
+        live_trade_stats['sl'] += 1
+    elif exit_type == 'MANUAL':
+        live_trade_stats['manual'] += 1
+
+
+def append_bot_log_line(line):
+    """Append a bot log line and update any in-memory derived dashboard stats."""
+    bot_data['logs'].append(line)
+    record_trade_exit_from_log(line)
+
+
+def apply_live_trade_stats():
+    """Expose in-memory trade counters in the dashboard when file/database persistence is off."""
+    tp_count = live_trade_stats['tp']
+    sl_count = live_trade_stats['sl']
+    manual_count = live_trade_stats['manual']
+    closed_trades = tp_count + sl_count + manual_count
+    decisive_trades = tp_count + sl_count
+
+    bot_data['wins'] = tp_count
+    bot_data['losses'] = sl_count
+    bot_data['total_trades'] = closed_trades
+    bot_data['win_rate'] = (tp_count / decisive_trades * 100) if decisive_trades > 0 else 0
 
 
 def start_self_ping():
@@ -144,7 +186,7 @@ def init_binance_client():
         refresh_account_snapshot(force=True)
         return True
     except Exception as e:
-        bot_data['logs'].append(f"[ERROR] Failed to initialize Binance client: {str(e)}")
+        append_bot_log_line(f"[ERROR] Failed to initialize Binance client: {str(e)}")
         return False
 
 
@@ -157,7 +199,7 @@ def stream_bot_output(process):
         line = raw_line.strip()
         if not line:
             continue
-        bot_data['logs'].append(line)
+        append_bot_log_line(line)
         print(line, flush=True)
 
 def refresh_account_snapshot(force=False):
@@ -208,16 +250,13 @@ def refresh_account_snapshot(force=False):
         if is_rate_limit_error(exc):
             note_monitor_rate_limit(exc, "account snapshot")
             return
-        bot_data['logs'].append(f"[ERROR] Failed to refresh account snapshot: {str(exc)}")
+        append_bot_log_line(f"[ERROR] Failed to refresh account snapshot: {str(exc)}")
 
 def update_trade_stats():
     """Update trade statistics from database"""
     global bot_data
     if not DATABASE_ENABLED or DATABASE_PATH is None:
-        bot_data['total_trades'] = 0
-        bot_data['wins'] = 0
-        bot_data['losses'] = 0
-        bot_data['win_rate'] = 0
+        apply_live_trade_stats()
         return
     try:
         if DATABASE_PATH.exists():
@@ -263,7 +302,7 @@ def update_trade_stats():
 
             conn.close()
     except Exception as e:
-        bot_data['logs'].append(f"[ERROR] Failed to update trade stats: {str(e)}")
+        append_bot_log_line(f"[ERROR] Failed to update trade stats: {str(e)}")
 
 def monitor_bot_logs():
     """Monitor bot log file for updates"""
@@ -283,10 +322,10 @@ def monitor_bot_logs():
             f.seek(log_file_offset)
             for line in f:
                 if line.strip():
-                    bot_data['logs'].append(line.strip())
+                    append_bot_log_line(line.strip())
             log_file_offset = f.tell()
     except Exception as e:
-        bot_data['logs'].append(f"[ERROR] Failed to read log file: {str(e)}")
+        append_bot_log_line(f"[ERROR] Failed to read log file: {str(e)}")
 
 def update_spy_regime():
     """Load the cached SPY regime used by the live bot."""
@@ -338,10 +377,10 @@ def start_bot():
                     daemon=True,
                 ).start()
 
-            bot_data['logs'].append("[INFO] Trading bot started")
+            append_bot_log_line("[INFO] Trading bot started")
             return True
     except Exception as e:
-        bot_data['logs'].append(f"[ERROR] Failed to start bot: {str(e)}")
+        append_bot_log_line(f"[ERROR] Failed to start bot: {str(e)}")
         return False
 
 @app.route('/')
@@ -381,7 +420,7 @@ def stop_bot_api():
     try:
         if bot_process and bot_process.poll() is None:
             bot_process.terminate()
-            bot_data['logs'].append("[INFO] Trading bot stopped")
+            append_bot_log_line("[INFO] Trading bot stopped")
             return jsonify({'success': True, 'message': 'Bot stopped'})
         else:
             return jsonify({'success': False, 'message': 'Bot not running'})
@@ -1608,9 +1647,9 @@ HTML_TEMPLATE = '''
 if __name__ == '__main__':
     # Initialize Binance client
     if init_binance_client():
-        bot_data['logs'].append("[INFO] Binance client initialized successfully")
+        append_bot_log_line("[INFO] Binance client initialized successfully")
     else:
-        bot_data['logs'].append("[ERROR] Failed to initialize Binance client")
+        append_bot_log_line("[ERROR] Failed to initialize Binance client")
 
     start_self_ping()
 
