@@ -1560,12 +1560,45 @@ HTML_TEMPLATE = '''
 
     <script>
         let pendingBotAction = null;
+        const IST_TIME_ZONE = 'Asia/Kolkata';
+        const LOG_TIMESTAMP_RE = /\b(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})(,\d{3})?\b/g;
 
         function formatNumber(num) {
             if (num >= 1000) {
                 return (num / 1000).toFixed(1) + 'k';
             }
             return num.toFixed(2);
+        }
+
+        function convertUtcLogTimestampsToIst(log) {
+            return log.replace(LOG_TIMESTAMP_RE, (_, datePart, timePart, millisPart = '') => {
+                const isoMillis = millisPart ? millisPart.replace(',', '.') : '';
+                const utcDate = new Date(`${datePart}T${timePart}${isoMillis}Z`);
+
+                if (Number.isNaN(utcDate.getTime())) {
+                    return `${datePart} ${timePart}${millisPart}`;
+                }
+
+                const formatter = new Intl.DateTimeFormat('en-GB', {
+                    timeZone: IST_TIME_ZONE,
+                    year: 'numeric',
+                    month: '2-digit',
+                    day: '2-digit',
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit',
+                    hour12: false,
+                });
+
+                const parts = Object.fromEntries(
+                    formatter
+                        .formatToParts(utcDate)
+                        .filter(part => part.type !== 'literal')
+                        .map(part => [part.type, part.value])
+                );
+
+                return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}${millisPart}`;
+            });
         }
 
         function formatPriceValue(value) {
@@ -1732,7 +1765,9 @@ HTML_TEMPLATE = '''
                 if (data.logs.length > 0) {
                     // Clean logs from Unicode characters
                     const cleanLogs = data.logs.map(log =>
-                        log.replace(/\\u[\\dA-F]{4}/gi, '').replace(/\\U[\\dA-F]{8}/gi, '')
+                        convertUtcLogTimestampsToIst(
+                            log.replace(/\\u[\\dA-F]{4}/gi, '').replace(/\\U[\\dA-F]{8}/gi, '')
+                        )
                     );
                     logsEl.innerHTML = cleanLogs.slice(-30).map(log =>
                         `<div class="log-line">${log}</div>`
