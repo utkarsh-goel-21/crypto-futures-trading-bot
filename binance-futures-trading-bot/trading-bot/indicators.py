@@ -62,6 +62,9 @@ class IndicatorCalculator:
             
         except Exception as e:
             logger.error(f"Error fetching data for {self.coin} {timeframe}: {e}")
+            message = str(e)
+            if "code=-1003" in message or "Too many requests" in message or "banned until" in message:
+                raise
             return None
     
     def calculate_all_indicators(self, df):

@@ -588,11 +588,31 @@ class TradingBot:
             for timeframe in {manager.entry_timeframe, manager.trend_timeframe}:
                 df = None
                 for attempt in range(1, 4):
-                    df = manager.indicator_calc.fetch_historical_data(
-                        self.client,
-                        timeframe,
-                        limit=CANDLES_REQUIRED,
-                    )
+                    if self.rest_backoff_active():
+                        wait_seconds = max(1.0, self.rest_backoff_until - time.time())
+                        logger.warning(
+                            f"⚠️ Waiting {wait_seconds:.1f}s before loading {coin} {timeframe} history because Binance REST is rate-limited"
+                        )
+                        time.sleep(wait_seconds)
+
+                    try:
+                        df = manager.indicator_calc.fetch_historical_data(
+                            self.client,
+                            timeframe,
+                            limit=CANDLES_REQUIRED,
+                        )
+                    except Exception as exc:
+                        if is_rate_limit_error(exc):
+                            self.note_rate_limit(f"initial history {coin} {timeframe}", exc, fallback_seconds=60)
+                            wait_seconds = max(1.0, self.rest_backoff_until - time.time())
+                            logger.warning(
+                                f"⚠️ Failed to load {coin} {timeframe} history (attempt {attempt}/3). "
+                                f"Waiting {wait_seconds:.1f}s for Binance REST backoff"
+                            )
+                            time.sleep(wait_seconds)
+                            continue
+                        raise
+
                     if df is not None and len(df) >= 2:
                         df = df.tail(CANDLES_REQUIRED).copy()
                         break
