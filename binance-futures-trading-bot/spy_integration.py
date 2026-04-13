@@ -14,8 +14,10 @@ from runtime_config import get_spy_predictor_api_url
 
 LOGGER = logging.getLogger(__name__)
 SPY_RESULT_MARKER = "__SPY_REGIME_JSON__="
-SPY_MARKET_REFRESH_HOUR_NY = 18
-SPY_STALE_RETRY_COOLDOWN_SECONDS = 30 * 60
+SPY_MARKET_CLOSE_HOUR_NY = 16
+SPY_MARKET_CLOSE_MINUTE_NY = 0
+SPY_MARKET_REFRESH_DELAY_MINUTES = 15
+SPY_STALE_RETRY_COOLDOWN_SECONDS = SPY_MARKET_REFRESH_DELAY_MINUTES * 60
 
 
 class SpyRegimeFilter:
@@ -86,14 +88,31 @@ class SpyRegimeFilter:
             candidate -= timedelta(days=1)
         return candidate
 
+    def _ny_now(self, now: Optional[datetime] = None) -> datetime:
+        """Return the current market clock in New York."""
+        return (
+            now.astimezone(ZoneInfo("America/New_York"))
+            if now
+            else datetime.now(ZoneInfo("America/New_York"))
+        )
+
+    def _market_refresh_gate(self, current_time: datetime) -> datetime:
+        """Return the earliest New York time when the new daily close is accepted."""
+        return current_time.replace(
+            hour=SPY_MARKET_CLOSE_HOUR_NY,
+            minute=SPY_MARKET_CLOSE_MINUTE_NY,
+            second=0,
+            microsecond=0,
+        ) + timedelta(minutes=SPY_MARKET_REFRESH_DELAY_MINUTES)
+
     def _expected_latest_as_of_date(self, now: Optional[datetime] = None) -> date:
-        ny_now = now.astimezone(ZoneInfo("America/New_York")) if now else datetime.now(ZoneInfo("America/New_York"))
+        ny_now = self._ny_now(now)
         current_day = ny_now.date()
 
         if current_day.weekday() >= 5:
             return self._previous_business_day(current_day)
 
-        if ny_now.hour < SPY_MARKET_REFRESH_HOUR_NY:
+        if ny_now < self._market_refresh_gate(ny_now):
             return self._previous_business_day(current_day)
 
         return current_day
@@ -107,11 +126,22 @@ class SpyRegimeFilter:
         except ValueError:
             return None
 
-    def _matches_market_freshness(self, cache: Dict[str, Any]) -> bool:
+    def _matches_market_freshness(self, cache: Dict[str, Any], now: Optional[datetime] = None) -> bool:
         as_of_date = self._parse_as_of_date(cache)
         if as_of_date is None:
             return False
-        return as_of_date >= self._expected_latest_as_of_date()
+
+        ny_now = self._ny_now(now)
+        expected_as_of_date = self._expected_latest_as_of_date(ny_now)
+        current_day = ny_now.date()
+
+        if current_day.weekday() >= 5:
+            return as_of_date == expected_as_of_date
+
+        if ny_now < self._market_refresh_gate(ny_now):
+            return as_of_date == expected_as_of_date
+
+        return as_of_date >= expected_as_of_date
 
     def _retry_due_for_market_staleness(self, cache: Dict[str, Any]) -> bool:
         retry_after_epoch = cache.get("market_stale_retry_after_epoch")

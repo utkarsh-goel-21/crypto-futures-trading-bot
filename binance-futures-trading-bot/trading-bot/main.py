@@ -348,6 +348,11 @@ class PositionTracker:
         with self.lock:
             return len(self.positions)
 
+    def get_all_positions(self):
+        """Return a shallow copy of tracked open positions."""
+        with self.lock:
+            return dict(self.positions)
+
 # ========================================
 # COIN MANAGER
 # ========================================
@@ -432,6 +437,7 @@ class TradingBot:
         # OPTIMIZATION ALIGNMENT: Pending signals for delayed execution
         self.pending_signals = {}  # {coin: {'signal': 'LONG/SHORT', 'strength': float, 'filters': dict}}
         self.spy_regime_filter = SpyRegimeFilter(PROJECT_ROOT)
+        self.active_spy_regime = None
 
         stats_tracker.update_position_tracker(self.position_tracker)
 
@@ -455,6 +461,11 @@ class TradingBot:
         """Log the currently active cached SPY regime."""
         try:
             regime = self.spy_regime_filter.get_regime()
+            self.active_spy_regime = {
+                'regime': regime.get('regime'),
+                'as_of_date': regime.get('as_of_date'),
+                'predicting_for': regime.get('predicting_for'),
+            }
             logger.info(
                 "🧭 Active SPY regime: %s | as_of=%s | predicting_for=%s | source=%s | cache=%s",
                 regime.get('regime', 'unknown'),
@@ -465,6 +476,114 @@ class TradingBot:
             )
         except Exception as exc:
             logger.error(f"❌ Failed to load SPY regime on startup: {exc}")
+
+    def calculate_unrealized_position_pnl(self, coin, position):
+        """Calculate the latest unrealized PnL for one tracked position."""
+        ticker = self.client.futures_symbol_ticker(symbol=coin)
+        current_price = float(ticker['price'])
+        entry_price = float(position['entry_price'])
+
+        if position['side'] == 'LONG':
+            pnl_pct = ((current_price - entry_price) / entry_price) * 100
+        else:
+            pnl_pct = ((entry_price - current_price) / entry_price) * 100
+
+        pnl_value = (pnl_pct / 100) * MARGIN_PER_TRADE
+        return current_price, pnl_pct, pnl_value
+
+    def maybe_handle_spy_bias_change(self):
+        """Close the current basket once when the daily SPY bias flips and basket PnL is positive."""
+        try:
+            regime = self.spy_regime_filter.get_regime()
+        except Exception as exc:
+            logger.error(f"❌ Failed to refresh SPY regime during trading loop: {exc}")
+            return
+
+        current_regime = {
+            'regime': regime.get('regime'),
+            'as_of_date': regime.get('as_of_date'),
+            'predicting_for': regime.get('predicting_for'),
+        }
+
+        previous_regime = self.active_spy_regime
+        if previous_regime is None:
+            self.active_spy_regime = current_regime
+            return
+
+        if current_regime == previous_regime:
+            return
+
+        logger.info(
+            "🧭 SPY regime updated: %s (%s -> %s) => %s (%s -> %s)",
+            previous_regime.get('regime', 'unknown'),
+            previous_regime.get('as_of_date', 'unknown'),
+            previous_regime.get('predicting_for', 'unknown'),
+            current_regime.get('regime', 'unknown'),
+            current_regime.get('as_of_date', 'unknown'),
+            current_regime.get('predicting_for', 'unknown'),
+        )
+
+        self.active_spy_regime = current_regime
+
+        if previous_regime.get('regime') == current_regime.get('regime'):
+            return
+
+        active_positions = self.position_tracker.get_all_positions()
+        if not active_positions:
+            logger.info("🧭 SPY bias changed but there are no active positions to review")
+            return
+
+        basket_snapshots = []
+        basket_pnl_value = 0.0
+
+        for coin, position in active_positions.items():
+            try:
+                current_price, pnl_pct, pnl_value = self.calculate_unrealized_position_pnl(coin, position)
+            except Exception as exc:
+                logger.error(f"❌ Failed to evaluate {coin} for SPY bias-change exit: {exc}")
+                return
+
+            basket_snapshots.append({
+                'coin': coin,
+                'side': position['side'],
+                'current_price': current_price,
+                'pnl_pct': pnl_pct,
+                'pnl_value': pnl_value,
+            })
+            basket_pnl_value += pnl_value
+
+        logger.info(
+            "🧭 SPY bias flip detected: %s -> %s | active basket unrealized PnL: $%.2f across %s position(s)",
+            previous_regime.get('regime', 'unknown'),
+            current_regime.get('regime', 'unknown'),
+            basket_pnl_value,
+            len(basket_snapshots),
+        )
+
+        if basket_pnl_value <= 0:
+            logger.info("🧭 Bias-change close skipped because active basket unrealized PnL is not positive")
+            return
+
+        logger.warning(
+            "🧭 Bias-change close triggered: closing %s active position(s) because basket unrealized PnL is positive ($%.2f)",
+            len(basket_snapshots),
+            basket_pnl_value,
+        )
+
+        for snapshot in basket_snapshots:
+            coin = snapshot['coin']
+            if not self.position_tracker.has_position(coin):
+                continue
+
+            closed = self.close_position_market(coin, reason="BIAS_CHANGE")
+            if closed:
+                logger.info(
+                    "🧭 %s closed by SPY bias change @ $%.2f | unrealized snapshot: %.2f%% ($%.2f)",
+                    coin,
+                    snapshot['current_price'],
+                    snapshot['pnl_pct'],
+                    snapshot['pnl_value'],
+                )
 
     def is_signal_allowed_by_spy(self, coin, signal, phase):
         """Allow only trades aligned with the cached daily SPY regime."""
@@ -1906,6 +2025,8 @@ class TradingBot:
                     #     summary = stats_tracker.format_daily_discord_summary()
                     #     if summary:
                     #         discord.send_message(summary)
+
+                self.maybe_handle_spy_bias_change()
                 
                 # Check each coin for order fills
                 for coin in ACTIVE_COINS:

@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template_string, request
@@ -59,7 +59,9 @@ SELF_PING_INTERVAL_SECONDS = 600
 ACCOUNT_REFRESH_SECONDS = 30
 TP_SL_CACHE_REFRESH_SECONDS = 15 * 60
 RATE_LIMIT_BAN_UNTIL_RE = re.compile(r"banned until (\d+)")
-TRADE_EXIT_RE = re.compile(r"Closed:\s+(TP|SL|MANUAL)\s+@")
+TRADE_EXIT_RE = re.compile(
+    r"Closed:\s+([A-Z_]+)\s+@\s+\$[-+]?\d+(?:\.\d+)?\s+\|\s+PnL:\s+([-+]?\d+(?:\.\d+)?)%"
+)
 
 # Global variables for storing bot data
 bot_data = {
@@ -79,9 +81,13 @@ bot_data = {
 }
 
 live_trade_stats = {
+    'total': 0,
+    'wins': 0,
+    'losses': 0,
     'tp': 0,
     'sl': 0,
     'manual': 0,
+    'bias_change': 0,
 }
 
 # Binance client
@@ -205,12 +211,23 @@ def record_trade_exit_from_log(line):
         return
 
     exit_type = match.group(1)
+    pnl_pct = float(match.group(2))
+    live_trade_stats['total'] += 1
+
     if exit_type == 'TP':
         live_trade_stats['tp'] += 1
+        live_trade_stats['wins'] += 1
     elif exit_type == 'SL':
         live_trade_stats['sl'] += 1
+        live_trade_stats['losses'] += 1
     elif exit_type == 'MANUAL':
         live_trade_stats['manual'] += 1
+    elif exit_type == 'BIAS_CHANGE':
+        live_trade_stats['bias_change'] += 1
+        if pnl_pct > 0:
+            live_trade_stats['wins'] += 1
+        else:
+            live_trade_stats['losses'] += 1
 
 
 def append_bot_log_line(line):
@@ -221,22 +238,21 @@ def append_bot_log_line(line):
 
 def apply_live_trade_stats():
     """Expose in-memory trade counters in the dashboard when file/database persistence is off."""
-    tp_count = live_trade_stats['tp']
-    sl_count = live_trade_stats['sl']
-    manual_count = live_trade_stats['manual']
-    closed_trades = tp_count + sl_count + manual_count
-    decisive_trades = tp_count + sl_count
+    wins = live_trade_stats['wins']
+    losses = live_trade_stats['losses']
+    closed_trades = live_trade_stats['total']
+    decisive_trades = wins + losses
 
-    bot_data['wins'] = tp_count
-    bot_data['losses'] = sl_count
+    bot_data['wins'] = wins
+    bot_data['losses'] = losses
     bot_data['total_trades'] = closed_trades
-    bot_data['win_rate'] = (tp_count / decisive_trades * 100) if decisive_trades > 0 else 0
+    bot_data['win_rate'] = (wins / decisive_trades * 100) if decisive_trades > 0 else 0
 
 
 def mark_bot_session_start():
     """Start a fresh dashboard session baseline for the current bot process lifetime."""
     global bot_session_started_at, bot_session_start_balance, bot_session_start_balance_pending
-    bot_session_started_at = datetime.now()
+    bot_session_started_at = datetime.now(timezone.utc)
 
     current_balance = bot_data.get('balance', 0)
     if current_balance and current_balance > 0:
@@ -274,6 +290,7 @@ def get_bot_session_stats():
         'losses': int(bot_data.get('losses') or 0),
         'total_closed': int(bot_data.get('total_trades') or 0),
         'manual_closes': int(live_trade_stats.get('manual') or 0),
+        'bias_change_closes': int(live_trade_stats.get('bias_change') or 0),
         'pending_start_balance': bool(bot_session_start_balance_pending),
     }
 
@@ -458,13 +475,26 @@ def update_trade_stats():
                 total = cursor.fetchone()
                 bot_data['total_trades'] = total[0] if total else 0
 
-                cursor.execute("SELECT COUNT(*) FROM trades WHERE pnl_value > 0")
-                wins = cursor.fetchone()
-                bot_data['wins'] = wins[0] if wins else 0
+                if "exit_type" in columns:
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM trades WHERE exit_type != 'MANUAL' AND pnl_value > 0"
+                    )
+                    wins = cursor.fetchone()
+                    bot_data['wins'] = wins[0] if wins else 0
 
-                cursor.execute("SELECT COUNT(*) FROM trades WHERE pnl_value <= 0")
-                losses = cursor.fetchone()
-                bot_data['losses'] = losses[0] if losses else 0
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM trades WHERE exit_type != 'MANUAL' AND pnl_value <= 0"
+                    )
+                    losses = cursor.fetchone()
+                    bot_data['losses'] = losses[0] if losses else 0
+                else:
+                    cursor.execute("SELECT COUNT(*) FROM trades WHERE pnl_value > 0")
+                    wins = cursor.fetchone()
+                    bot_data['wins'] = wins[0] if wins else 0
+
+                    cursor.execute("SELECT COUNT(*) FROM trades WHERE pnl_value <= 0")
+                    losses = cursor.fetchone()
+                    bot_data['losses'] = losses[0] if losses else 0
             elif {"exit_time", "profit"}.issubset(columns):
                 cursor.execute("SELECT COUNT(*) FROM trades WHERE exit_time IS NOT NULL")
                 total = cursor.fetchone()
@@ -1899,6 +1929,10 @@ HTML_TEMPLATE = '''
                 <div class="detail-card">
                     <div class="detail-key">Manual closes</div>
                     <div class="detail-value">${sessionStats.manual_closes}</div>
+                </div>
+                <div class="detail-card">
+                    <div class="detail-key">Bias-change closes</div>
+                    <div class="detail-value">${sessionStats.bias_change_closes || 0}</div>
                 </div>
                 <div class="detail-card">
                     <div class="detail-key">Active positions</div>
