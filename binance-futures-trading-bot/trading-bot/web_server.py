@@ -717,7 +717,11 @@ HTML_TEMPLATE = '''
             --green-soft: #f5f7fb;
             --green-tint: rgba(136, 213, 143, 0.10);
             --green-line: rgba(136, 213, 143, 0.24);
+            --green-pill-tint: rgba(143, 207, 140, 0.12);
+            --green-pill-line: rgba(143, 207, 140, 0.22);
             --red: #ff8b8b;
+            --red-tint: rgba(255, 139, 139, 0.14);
+            --red-line: rgba(255, 139, 139, 0.24);
             --blue: #9bafff;
             --shadow: 0 18px 44px rgba(4, 7, 13, 0.28);
             --shadow-soft: 0 10px 24px rgba(4, 7, 13, 0.16);
@@ -1036,14 +1040,14 @@ HTML_TEMPLATE = '''
 
         .regime-long {
             color: var(--green);
-            background: rgba(143, 207, 140, 0.12);
-            border-color: rgba(143, 207, 140, 0.22);
+            background: var(--green-pill-tint);
+            border-color: var(--green-pill-line);
         }
 
         .regime-short {
             color: var(--red);
-            background: rgba(255, 139, 139, 0.14);
-            border-color: rgba(255, 139, 139, 0.24);
+            background: var(--red-tint);
+            border-color: var(--red-line);
         }
 
         .regime-copy {
@@ -1229,17 +1233,19 @@ HTML_TEMPLATE = '''
             font-size: 11px;
             font-weight: 700;
             letter-spacing: -0.01em;
+            border: 1px solid transparent;
         }
 
         .side-long {
-            background: rgba(143, 207, 140, 0.14);
             color: var(--green);
+            background: var(--green-pill-tint);
+            border-color: var(--green-pill-line);
         }
 
         .side-short {
             color: var(--red);
-            background: rgba(255, 139, 139, 0.14);
-            border: 1px solid rgba(255, 139, 139, 0.24);
+            background: var(--red-tint);
+            border-color: var(--red-line);
         }
 
         .position-details {
