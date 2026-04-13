@@ -20,7 +20,7 @@ import re
 from logging.handlers import RotatingFileHandler
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple
 import threading
 import signal
 import sys
@@ -271,6 +271,19 @@ class PositionTracker:
             logger.info(f"📈 Position opened: {coin} - {data['side']} @ ${data['entry_price']:.2f}")
             logger.info(f"   TP Order ID: {format_order_reference(data.get('tp_order_id'))}")
             logger.info(f"   SL Order ID: {format_order_reference(data.get('sl_order_id'))}")
+
+    def restore_position(self, coin, data):
+        """Restore an already-open exchange position into local bot state."""
+        with self.lock:
+            self.positions[coin] = data
+
+        protection_status = "protected" if data.get('tp_order_id') and data.get('sl_order_id') else "missing-protection"
+        logger.warning(
+            f"♻️ Restored Binance position: {coin} - {data['side']} @ ${data['entry_price']:.2f} "
+            f"| qty={data['quantity']:.6f} | protection={protection_status}"
+        )
+        logger.info(f"   Restored TP Order ID: {format_order_reference(data.get('tp_order_id'))}")
+        logger.info(f"   Restored SL Order ID: {format_order_reference(data.get('sl_order_id'))}")
     
     def remove_position(self, coin):
         """Remove closed position"""
@@ -393,6 +406,7 @@ class TradingBot:
         # Wait through startup-time Binance REST rate limits instead of exiting and
         # forcing the web supervisor to be manually restarted later.
         self.ensure_exchange_ready()
+        self.restore_existing_exchange_positions()
 
         # Preload the daily SPY regime so entry gating uses a stable cached bias.
         self.log_active_spy_regime()
@@ -788,6 +802,172 @@ class TradingBot:
             return float(self.normalize_price(coin, price))
         except:
             return price
+
+    def is_truthy_exchange_flag(self, value):
+        """Interpret Binance boolean-ish order flags consistently."""
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        return str(value).strip().lower() in {"true", "1", "yes"}
+
+    def derive_expected_exit_price(self, coin, side, exit_type, entry_price):
+        """Fallback TP/SL price when an imported order does not expose stopPrice."""
+        params = self.coin_managers[coin].params['parameters']
+        if side == 'LONG':
+            raw_price = (
+                entry_price * (1 + params['tp_percent'])
+                if exit_type == 'TP'
+                else entry_price * (1 - params['sl_percent'])
+            )
+        else:
+            raw_price = (
+                entry_price * (1 - params['tp_percent'])
+                if exit_type == 'TP'
+                else entry_price * (1 + params['sl_percent'])
+            )
+        return self.format_price(coin, raw_price)
+
+    def fetch_open_conditional_orders(self, coin):
+        """Load currently open conditional orders for a symbol, respecting REST backoff."""
+        while True:
+            self.wait_for_rest_backoff(f"loading protective orders for {coin}")
+            try:
+                return self.client.futures_get_open_orders(symbol=coin, conditional=True)
+            except Exception as exc:
+                if is_rate_limit_error(exc):
+                    self.note_rate_limit(f"startup protective-order reconciliation {coin}", exc, fallback_seconds=60)
+                    continue
+                logger.error(f"❌ Failed to load protective orders for {coin}: {exc}")
+                return []
+
+    def identify_protective_orders(
+        self,
+        coin: str,
+        position_side: str,
+        open_orders,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """Pick the active TP and SL orders that belong to an already-open position."""
+        exit_side = 'SELL' if position_side == 'LONG' else 'BUY'
+        candidates = []
+
+        for order in open_orders or []:
+            order_side = str(order.get('side') or order.get('S') or '').upper()
+            order_type = str(order.get('type') or order.get('origType') or '').upper()
+            if order_side != exit_side:
+                continue
+            if order_type not in {'TAKE_PROFIT_MARKET', 'STOP_MARKET'}:
+                continue
+
+            reduce_only = order.get('reduceOnly')
+            close_position = order.get('closePosition')
+            if reduce_only is False and close_position is False:
+                continue
+
+            candidates.append(order)
+
+        candidates.sort(
+            key=lambda order: (
+                int(order.get('updateTime') or order.get('time') or 0),
+                int(order.get('orderId') or 0),
+            ),
+            reverse=True,
+        )
+
+        tp_order = None
+        sl_order = None
+
+        for order in candidates:
+            order_type = str(order.get('type') or order.get('origType') or '').upper()
+            if order_type == 'TAKE_PROFIT_MARKET' and tp_order is None:
+                tp_order = order
+            elif order_type == 'STOP_MARKET' and sl_order is None:
+                sl_order = order
+
+            if tp_order and sl_order:
+                break
+
+        return tp_order, sl_order
+
+    def restore_existing_exchange_positions(self):
+        """Import live Binance positions into local state so restart cannot stack extra exposure."""
+        while True:
+            self.wait_for_rest_backoff("reconciling existing Binance positions")
+            try:
+                positions = self.client.futures_position_information()
+                break
+            except Exception as exc:
+                if is_rate_limit_error(exc):
+                    self.note_rate_limit("startup position reconciliation", exc, fallback_seconds=60)
+                    continue
+                logger.error(f"❌ Failed to load existing Binance positions: {exc}")
+                return
+
+        restored_count = 0
+        missing_protection_count = 0
+
+        for raw_position in positions:
+            coin = raw_position.get('symbol')
+            if coin not in ACTIVE_COINS:
+                continue
+
+            try:
+                amount = float(raw_position.get('positionAmt', 0))
+            except (TypeError, ValueError):
+                amount = 0.0
+
+            if amount == 0:
+                continue
+
+            side = 'LONG' if amount > 0 else 'SHORT'
+            quantity = abs(amount)
+            entry_price = float(raw_position.get('entryPrice') or 0)
+
+            open_orders = self.fetch_open_conditional_orders(coin)
+            tp_order, sl_order = self.identify_protective_orders(coin, side, open_orders)
+
+            tp_order_ref = self.seed_order_cache(coin, tp_order) if tp_order else None
+            sl_order_ref = self.seed_order_cache(coin, sl_order) if sl_order else None
+
+            tp_stop_price = float(tp_order.get('stopPrice') or 0) if tp_order else 0.0
+            sl_stop_price = float(sl_order.get('stopPrice') or 0) if sl_order else 0.0
+
+            tp_price = tp_stop_price or self.derive_expected_exit_price(coin, side, 'TP', entry_price)
+            sl_price = sl_stop_price or self.derive_expected_exit_price(coin, side, 'SL', entry_price)
+
+            restored_data = {
+                'side': side,
+                'entry_price': entry_price,
+                'quantity': quantity,
+                'entry_time': datetime.now(),
+                'entry_order_id': f"restored:{coin}:{int(time.time())}",
+                'tp_order_id': tp_order_ref,
+                'sl_order_id': sl_order_ref,
+                'tp_price': tp_price,
+                'sl_price': sl_price,
+                'restored_from_exchange': True,
+                'protection_reconciled': bool(tp_order_ref and sl_order_ref),
+            }
+            self.position_tracker.restore_position(coin, restored_data)
+            restored_count += 1
+
+            if not restored_data['protection_reconciled']:
+                missing_protection_count += 1
+                logger.warning(
+                    f"⚠️ {coin} was restored without both TP/SL orders. "
+                    "New entries for this symbol remain blocked until the position is resolved."
+                )
+
+        if restored_count == 0:
+            logger.info("✅ No existing Binance positions to restore on startup")
+            return
+
+        logger.warning(f"♻️ Restored {restored_count} existing Binance position(s) on startup")
+        if missing_protection_count:
+            logger.warning(
+                f"⚠️ {missing_protection_count} restored position(s) are missing TP/SL protection. "
+                "The bot will keep those symbols blocked from new entries."
+            )
 
     def resolve_order_lookup_params(self, coin, order_ref):
         """Build Binance lookup params from a stored order reference."""
