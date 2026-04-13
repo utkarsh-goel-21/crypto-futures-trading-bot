@@ -159,6 +159,46 @@ def format_order_reference(order_ref):
 
     return str(order_ref)
 
+
+def extract_order_status(order_payload):
+    """Read status from either standard futures orders or algo/conditional futures orders."""
+    if not order_payload:
+        return None
+    return (
+        order_payload.get('status')
+        or order_payload.get('algoStatus')
+        or order_payload.get('X')
+        or order_payload.get('x')
+    )
+
+
+def extract_order_type(order_payload):
+    """Read order type from either standard or algo/conditional futures order payloads."""
+    if not order_payload:
+        return None
+    return (
+        order_payload.get('type')
+        or order_payload.get('origType')
+        or order_payload.get('orderType')
+    )
+
+
+def extract_order_trigger_price(order_payload):
+    """Read trigger/stop price from either standard or algo/conditional futures order payloads."""
+    if not order_payload:
+        return None
+    raw_value = (
+        order_payload.get('stopPrice')
+        or order_payload.get('triggerPrice')
+        or order_payload.get('price')
+    )
+    if raw_value in (None, '', '0', '0.0', '0.000', '0.00000'):
+        return None
+    try:
+        return float(raw_value)
+    except (TypeError, ValueError):
+        return None
+
 # ========================================
 # DATABASE CLEANUP FUNCTION (NEW)
 # ========================================
@@ -581,7 +621,7 @@ class TradingBot:
             return None
 
         cache_payload = {
-            'status': order_response.get('status', 'NEW'),
+            'status': extract_order_status(order_response) or 'NEW',
             'symbol': symbol,
             'updated_at': time.time(),
             'source': 'create_order',
@@ -853,15 +893,13 @@ class TradingBot:
 
         for order in open_orders or []:
             order_side = str(order.get('side') or order.get('S') or '').upper()
-            order_type = str(order.get('type') or order.get('origType') or '').upper()
+            order_type = str(extract_order_type(order) or '').upper()
             if order_side != exit_side:
                 continue
-            if order_type not in {'TAKE_PROFIT_MARKET', 'STOP_MARKET'}:
-                continue
-
-            reduce_only = order.get('reduceOnly')
-            close_position = order.get('closePosition')
-            if reduce_only is False and close_position is False:
+            if not (
+                order_type.startswith('TAKE_PROFIT')
+                or order_type.startswith('STOP')
+            ):
                 continue
 
             candidates.append(order)
@@ -878,10 +916,10 @@ class TradingBot:
         sl_order = None
 
         for order in candidates:
-            order_type = str(order.get('type') or order.get('origType') or '').upper()
-            if order_type == 'TAKE_PROFIT_MARKET' and tp_order is None:
+            order_type = str(extract_order_type(order) or '').upper()
+            if order_type.startswith('TAKE_PROFIT') and tp_order is None:
                 tp_order = order
-            elif order_type == 'STOP_MARKET' and sl_order is None:
+            elif order_type.startswith('STOP') and sl_order is None:
                 sl_order = order
 
             if tp_order and sl_order:
@@ -929,8 +967,8 @@ class TradingBot:
             tp_order_ref = self.seed_order_cache(coin, tp_order) if tp_order else None
             sl_order_ref = self.seed_order_cache(coin, sl_order) if sl_order else None
 
-            tp_stop_price = float(tp_order.get('stopPrice') or 0) if tp_order else 0.0
-            sl_stop_price = float(sl_order.get('stopPrice') or 0) if sl_order else 0.0
+            tp_stop_price = extract_order_trigger_price(tp_order) or 0.0
+            sl_stop_price = extract_order_trigger_price(sl_order) or 0.0
 
             tp_price = tp_stop_price or self.derive_expected_exit_price(coin, side, 'TP', entry_price)
             sl_price = sl_stop_price or self.derive_expected_exit_price(coin, side, 'SL', entry_price)
@@ -1035,7 +1073,7 @@ class TradingBot:
             open_orders = self.client.futures_get_open_orders(symbol=coin, conditional=True)
             for order in open_orders:
                 if self.order_matches_reference(order_ref, order):
-                    return order.get('status', 'NEW')
+                    return extract_order_status(order) or 'NEW'
         except Exception as exc:
             if is_rate_limit_error(exc):
                 self.note_rate_limit(f"conditional open orders {coin}", exc)
@@ -1045,7 +1083,7 @@ class TradingBot:
             all_orders = self.client.futures_get_all_orders(symbol=coin, conditional=True, limit=20)
             for order in reversed(all_orders):
                 if self.order_matches_reference(order_ref, order):
-                    return order.get('status', 'UNKNOWN')
+                    return extract_order_status(order) or 'UNKNOWN'
         except Exception as exc:
             if is_rate_limit_error(exc):
                 self.note_rate_limit(f"conditional all orders {coin}", exc)
@@ -1260,7 +1298,7 @@ class TradingBot:
         
         try:
             order = self.client.futures_get_order(**lookup_params)
-            return order['status']
+            return extract_order_status(order) or 'UNKNOWN'
         except Exception as exc:
             if is_rate_limit_error(exc):
                 self.note_rate_limit(f"order status check {coin}", exc)
