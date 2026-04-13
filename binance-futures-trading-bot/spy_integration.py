@@ -5,14 +5,17 @@ import requests
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from runtime_config import get_spy_predictor_api_url
 
 LOGGER = logging.getLogger(__name__)
 SPY_RESULT_MARKER = "__SPY_REGIME_JSON__="
+SPY_MARKET_REFRESH_HOUR_NY = 18
+SPY_STALE_RETRY_COOLDOWN_SECONDS = 30 * 60
 
 
 class SpyRegimeFilter:
@@ -76,6 +79,65 @@ class SpyRegimeFilter:
         if updated_at_epoch is None:
             return False
         return (time.time() - updated_at_epoch) < self.cache_ttl_seconds
+
+    def _previous_business_day(self, day: date) -> date:
+        candidate = day - timedelta(days=1)
+        while candidate.weekday() >= 5:
+            candidate -= timedelta(days=1)
+        return candidate
+
+    def _expected_latest_as_of_date(self, now: Optional[datetime] = None) -> date:
+        ny_now = now.astimezone(ZoneInfo("America/New_York")) if now else datetime.now(ZoneInfo("America/New_York"))
+        current_day = ny_now.date()
+
+        if current_day.weekday() >= 5:
+            return self._previous_business_day(current_day)
+
+        if ny_now.hour < SPY_MARKET_REFRESH_HOUR_NY:
+            return self._previous_business_day(current_day)
+
+        return current_day
+
+    def _parse_as_of_date(self, cache: Dict[str, Any]) -> Optional[date]:
+        raw_value = cache.get("as_of_date")
+        if not raw_value:
+            return None
+        try:
+            return date.fromisoformat(str(raw_value)[:10])
+        except ValueError:
+            return None
+
+    def _matches_market_freshness(self, cache: Dict[str, Any]) -> bool:
+        as_of_date = self._parse_as_of_date(cache)
+        if as_of_date is None:
+            return False
+        return as_of_date >= self._expected_latest_as_of_date()
+
+    def _retry_due_for_market_staleness(self, cache: Dict[str, Any]) -> bool:
+        retry_after_epoch = cache.get("market_stale_retry_after_epoch")
+        if retry_after_epoch is None:
+            return True
+        return time.time() >= retry_after_epoch
+
+    def _clear_market_staleness(self, cache: Dict[str, Any]) -> Dict[str, Any]:
+        fresh_cache = dict(cache)
+        fresh_cache.pop("market_stale_retry_after_epoch", None)
+        fresh_cache.pop("market_stale_retry_after_utc", None)
+        fresh_cache.pop("market_stale_warning", None)
+        return fresh_cache
+
+    def _mark_market_stale(self, cache: Dict[str, Any], warning: str) -> Dict[str, Any]:
+        stale_cache = dict(cache)
+        retry_after_epoch = time.time() + SPY_STALE_RETRY_COOLDOWN_SECONDS
+        stale_cache["cache_status"] = "stale"
+        stale_cache["market_stale_warning"] = warning
+        stale_cache["market_stale_retry_after_epoch"] = retry_after_epoch
+        stale_cache["market_stale_retry_after_utc"] = datetime.fromtimestamp(
+            retry_after_epoch,
+            tz=timezone.utc,
+        ).isoformat()
+        self._save_cache(stale_cache)
+        return stale_cache
 
     def _refresh_regime_from_api(self, api_url: str) -> Dict[str, Any]:
         response = requests.get(
@@ -182,18 +244,47 @@ print("__SPY_REGIME_JSON__=" + json.dumps(payload))
 
     def get_regime(self, force_refresh: bool = False) -> Dict[str, Any]:
         cache = self._load_cache()
-        if cache and not force_refresh and self._is_fresh(cache):
-            fresh_cache = dict(cache)
-            fresh_cache["cache_status"] = "cached"
-            return fresh_cache
+        expected_as_of_date = self._expected_latest_as_of_date()
+        if cache and not force_refresh:
+            if self._is_fresh(cache) and self._matches_market_freshness(cache):
+                fresh_cache = self._clear_market_staleness(cache)
+                fresh_cache["cache_status"] = "cached"
+                fresh_cache["expected_as_of_date"] = str(expected_as_of_date)
+                self._memory_cache = fresh_cache
+                return fresh_cache
+
+            if (
+                self._is_fresh(cache)
+                and not self._matches_market_freshness(cache)
+                and not self._retry_due_for_market_staleness(cache)
+            ):
+                stale_cache = dict(cache)
+                stale_cache["cache_status"] = "stale"
+                stale_cache["expected_as_of_date"] = str(expected_as_of_date)
+                return stale_cache
 
         try:
-            return self._refresh_regime()
+            refreshed = self._refresh_regime()
+            refreshed["expected_as_of_date"] = str(expected_as_of_date)
+            if self._matches_market_freshness(refreshed):
+                fresh_cache = self._clear_market_staleness(refreshed)
+                fresh_cache["cache_status"] = "fresh"
+                self._save_cache(fresh_cache)
+                return fresh_cache
+
+            warning = (
+                f"Expected SPY as_of_date >= {expected_as_of_date}, "
+                f"but source returned {refreshed.get('as_of_date')}. "
+                f"Retrying after {SPY_STALE_RETRY_COOLDOWN_SECONDS // 60} minutes."
+            )
+            LOGGER.warning(warning)
+            return self._mark_market_stale(refreshed, warning)
         except Exception as exc:
             if cache:
                 stale_cache = dict(cache)
                 stale_cache["cache_status"] = "stale"
                 stale_cache["refresh_error"] = str(exc)
+                stale_cache["expected_as_of_date"] = str(expected_as_of_date)
                 LOGGER.warning(f"Using stale SPY regime cache after refresh failure: {exc}")
                 self._memory_cache = stale_cache
                 return stale_cache
