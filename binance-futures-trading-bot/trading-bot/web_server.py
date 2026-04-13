@@ -560,6 +560,7 @@ HTML_TEMPLATE = '''
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Trading Bot</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%230d1117'/%3E%3Cpath d='M14 42 L25 31 L34 37 L49 20' fill='none' stroke='%2388d58f' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='49' cy='20' r='5' fill='%2388d58f'/%3E%3C/svg%3E">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@500;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=Outfit:wght@500;700;800&display=swap" rel="stylesheet">
@@ -953,6 +954,34 @@ HTML_TEMPLATE = '''
         .pill-muted {
             color: #b7b7b7;
             background: rgba(255, 255, 255, 0.03);
+        }
+
+        .regime-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .external-link-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 11px 14px;
+            border-radius: 14px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            background: rgba(255, 255, 255, 0.04);
+            color: var(--text);
+            text-decoration: none;
+            font-size: 12px;
+            font-weight: 800;
+            letter-spacing: -0.01em;
+            transition: transform 0.16s ease, border-color 0.16s ease, background 0.16s ease;
+        }
+
+        .external-link-btn:hover {
+            transform: translateY(-1px);
+            border-color: rgba(136, 213, 143, 0.26);
+            background: rgba(136, 213, 143, 0.09);
         }
 
         .positions {
@@ -1577,6 +1606,11 @@ HTML_TEMPLATE = '''
                     <div>
                         <div class="detail-key">Lagging external features</div>
                         <div class="pill-row">${pills}</div>
+                    </div>
+                    <div class="regime-actions">
+                        <a class="external-link-btn" href="https://spy-predictor-ui.onrender.com/" target="_blank" rel="noopener noreferrer">
+                            Open SPY predictor
+                        </a>
                     </div>
                 </div>
             `;
