@@ -92,6 +92,9 @@ log_file_offset = 0
 monitor_next_account_refresh_at = 0.0
 monitor_rate_limit_until = 0.0
 monitor_position_targets_cache = {}
+bot_session_started_at = None
+bot_session_start_balance = None
+bot_session_start_balance_pending = False
 
 
 def is_rate_limit_error(exc):
@@ -230,6 +233,51 @@ def apply_live_trade_stats():
     bot_data['win_rate'] = (tp_count / decisive_trades * 100) if decisive_trades > 0 else 0
 
 
+def mark_bot_session_start():
+    """Start a fresh dashboard session baseline for the current bot process lifetime."""
+    global bot_session_started_at, bot_session_start_balance, bot_session_start_balance_pending
+    bot_session_started_at = datetime.now()
+
+    current_balance = bot_data.get('balance', 0)
+    if current_balance and current_balance > 0:
+        bot_session_start_balance = float(current_balance)
+        bot_session_start_balance_pending = False
+    else:
+        bot_session_start_balance = None
+        bot_session_start_balance_pending = True
+
+
+def get_bot_session_stats():
+    """Return bot-session stats for the dashboard modal."""
+    current_balance = float(bot_data.get('balance') or 0.0)
+    unrealized_pnl = float(bot_data.get('pnl') or 0.0)
+
+    if bot_session_start_balance is None:
+        realized_pnl = 0.0
+        total_pnl = unrealized_pnl
+        roi_pct = 0.0
+    else:
+        realized_pnl = current_balance - bot_session_start_balance
+        total_pnl = realized_pnl + unrealized_pnl
+        roi_pct = (total_pnl / bot_session_start_balance * 100) if bot_session_start_balance else 0.0
+
+    return {
+        'started_at': bot_session_started_at.isoformat() if bot_session_started_at else None,
+        'start_balance': bot_session_start_balance,
+        'current_balance': current_balance,
+        'realized_pnl': realized_pnl,
+        'unrealized_pnl': unrealized_pnl,
+        'total_pnl': total_pnl,
+        'roi_pct': roi_pct,
+        'active_positions': len(bot_data.get('active_trades') or []),
+        'wins': int(bot_data.get('wins') or 0),
+        'losses': int(bot_data.get('losses') or 0),
+        'total_closed': int(bot_data.get('total_trades') or 0),
+        'manual_closes': int(live_trade_stats.get('manual') or 0),
+        'pending_start_balance': bool(bot_session_start_balance_pending),
+    }
+
+
 def start_self_ping():
     """Keep the web service warm independently of bot start/stop state."""
     if RENDER_EXTERNAL_URL and CONFIGURED_SELF_PING_URL and CONFIGURED_SELF_PING_URL.rstrip("/") != SELF_PING_URL:
@@ -288,6 +336,7 @@ def stream_bot_output(process):
 def refresh_account_snapshot(force=False):
     """Refresh balance and positions with lighter Binance endpoints and rate-limit backoff."""
     global bot_data, monitor_next_account_refresh_at, monitor_position_targets_cache
+    global bot_session_start_balance, bot_session_start_balance_pending
 
     if not client:
         return
@@ -376,6 +425,9 @@ def refresh_account_snapshot(force=False):
         bot_data['balance'] = total_balance
         bot_data['pnl'] = total_unrealized
         bot_data['active_trades'] = active_positions
+        if bot_session_start_balance_pending and total_balance > 0:
+            bot_session_start_balance = total_balance
+            bot_session_start_balance_pending = False
         monitor_position_targets_cache = {
             symbol: cached_targets
             for symbol, cached_targets in monitor_position_targets_cache.items()
@@ -505,6 +557,7 @@ def start_bot():
                 popen_kwargs["bufsize"] = 1
 
             bot_process = subprocess.Popen(**popen_kwargs)
+            mark_bot_session_start()
 
             if not LOG_TO_FILE:
                 threading.Thread(
@@ -539,6 +592,7 @@ def get_data():
     # Convert deque to list for JSON serialization
     data = bot_data.copy()
     data['logs'] = list(bot_data['logs'])
+    data['session_stats'] = get_bot_session_stats()
     return jsonify(data)
 
 @app.route('/api/start', methods=['POST'])
@@ -834,6 +888,20 @@ HTML_TEMPLATE = '''
             letter-spacing: -0.01em;
         }
 
+        .meta-button {
+            appearance: none;
+            font-family: 'DM Sans', sans-serif;
+            cursor: pointer;
+            color: var(--text);
+            transition: transform 0.16s ease, border-color 0.16s ease, background 0.16s ease;
+        }
+
+        .meta-button:hover {
+            transform: translateY(-1px);
+            border-color: rgba(155, 175, 255, 0.24);
+            background: rgba(155, 175, 255, 0.10);
+        }
+
         .controls {
             display: flex;
             gap: 12px;
@@ -943,9 +1011,9 @@ HTML_TEMPLATE = '''
         }
 
         .regime-short {
-            color: #FF4B4B;
-            background: rgba(255, 75, 75, 0.14);
-            border-color: rgba(255, 75, 75, 0.24);
+            color: var(--red);
+            background: rgba(255, 139, 139, 0.14);
+            border-color: rgba(255, 139, 139, 0.24);
         }
 
         .regime-copy {
@@ -1340,6 +1408,13 @@ HTML_TEMPLATE = '''
             margin-bottom: 18px;
         }
 
+        .session-stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+            margin-top: 18px;
+        }
+
         .form-input {
             width: 100%;
             margin-bottom: 12px;
@@ -1472,6 +1547,7 @@ HTML_TEMPLATE = '''
                             <span class="meta-chip">9 tracked pairs</span>
                             <span class="meta-chip">SPY bias active</span>
                             <span class="last-update" id="last-update">Last update: Never</span>
+                            <button class="meta-chip meta-button" type="button" onclick="openSessionStatsModal()">Session stats</button>
                         </div>
                     </div>
                     <div class="controls">
@@ -1556,6 +1632,23 @@ HTML_TEMPLATE = '''
             <div id="followers-list" class="followers-list"></div>
         </div>
     </div>
+    <div id="session-stats-modal" class="modal-backdrop" style="display:none;" onclick="handleSessionStatsBackdrop(event)">
+        <div class="modal-panel">
+            <h3 class="modal-title">Session Stats</h3>
+            <div class="modal-copy">
+                Session metrics for the current bot runtime. These reset when the bot starts again.
+            </div>
+            <div id="session-stats-content" class="session-stats-grid">
+                <div class="detail-card">
+                    <div class="detail-key">Loading</div>
+                    <div class="detail-value">Fetching session stats...</div>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-stop btn-compact" onclick="closeSessionStatsModal()">Close</button>
+            </div>
+        </div>
+    </div>
 
 
     <script>
@@ -1568,6 +1661,53 @@ HTML_TEMPLATE = '''
                 return (num / 1000).toFixed(1) + 'k';
             }
             return num.toFixed(2);
+        }
+
+        function formatMoneyValue(value) {
+            if (value === null || value === undefined || Number.isNaN(value)) {
+                return 'N/A';
+            }
+            const numeric = Number(value);
+            return `${numeric >= 0 ? '+' : ''}${numeric.toFixed(2)} USDT`;
+        }
+
+        function formatPercentValue(value) {
+            if (value === null || value === undefined || Number.isNaN(value)) {
+                return 'N/A';
+            }
+            const numeric = Number(value);
+            return `${numeric >= 0 ? '+' : ''}${numeric.toFixed(2)}%`;
+        }
+
+        function formatSessionDateTime(value) {
+            if (!value) {
+                return 'N/A';
+            }
+
+            const date = new Date(value);
+            if (Number.isNaN(date.getTime())) {
+                return value;
+            }
+
+            const formatter = new Intl.DateTimeFormat('en-GB', {
+                timeZone: IST_TIME_ZONE,
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: false,
+            });
+
+            const parts = Object.fromEntries(
+                formatter
+                    .formatToParts(date)
+                    .filter(part => part.type !== 'literal')
+                    .map(part => [part.type, part.value])
+            );
+
+            return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
         }
 
         function convertUtcLogTimestampsToIst(log) {
@@ -1703,6 +1843,84 @@ HTML_TEMPLATE = '''
             `;
         }
 
+        function renderSessionStats(sessionStats) {
+            const contentEl = document.getElementById('session-stats-content');
+            if (!sessionStats) {
+                contentEl.innerHTML = `
+                    <div class="detail-card">
+                        <div class="detail-key">Session stats</div>
+                        <div class="detail-value">Unavailable</div>
+                    </div>
+                `;
+                return;
+            }
+
+            const startBalance = sessionStats.pending_start_balance
+                ? 'Waiting for balance...'
+                : formatMoneyValue(sessionStats.start_balance);
+
+            contentEl.innerHTML = `
+                <div class="detail-card">
+                    <div class="detail-key">Session started</div>
+                    <div class="detail-value">${formatSessionDateTime(sessionStats.started_at)}</div>
+                </div>
+                <div class="detail-card">
+                    <div class="detail-key">Starting balance</div>
+                    <div class="detail-value">${startBalance}</div>
+                </div>
+                <div class="detail-card">
+                    <div class="detail-key">Current balance</div>
+                    <div class="detail-value">${formatMoneyValue(sessionStats.current_balance)}</div>
+                </div>
+                <div class="detail-card">
+                    <div class="detail-key">Realized PnL</div>
+                    <div class="detail-value">${formatMoneyValue(sessionStats.realized_pnl)}</div>
+                </div>
+                <div class="detail-card">
+                    <div class="detail-key">Unrealized PnL</div>
+                    <div class="detail-value">${formatMoneyValue(sessionStats.unrealized_pnl)}</div>
+                </div>
+                <div class="detail-card">
+                    <div class="detail-key">Total PnL</div>
+                    <div class="detail-value">${formatMoneyValue(sessionStats.total_pnl)}</div>
+                </div>
+                <div class="detail-card">
+                    <div class="detail-key">ROI</div>
+                    <div class="detail-value">${formatPercentValue(sessionStats.roi_pct)}</div>
+                </div>
+                <div class="detail-card">
+                    <div class="detail-key">Closed trades</div>
+                    <div class="detail-value">${sessionStats.total_closed}</div>
+                </div>
+                <div class="detail-card">
+                    <div class="detail-key">Wins / Losses</div>
+                    <div class="detail-value">${sessionStats.wins} / ${sessionStats.losses}</div>
+                </div>
+                <div class="detail-card">
+                    <div class="detail-key">Manual closes</div>
+                    <div class="detail-value">${sessionStats.manual_closes}</div>
+                </div>
+                <div class="detail-card">
+                    <div class="detail-key">Active positions</div>
+                    <div class="detail-value">${sessionStats.active_positions}</div>
+                </div>
+            `;
+        }
+
+        function openSessionStatsModal() {
+            document.getElementById('session-stats-modal').style.display = 'block';
+        }
+
+        function closeSessionStatsModal() {
+            document.getElementById('session-stats-modal').style.display = 'none';
+        }
+
+        function handleSessionStatsBackdrop(event) {
+            if (event.target.id === 'session-stats-modal') {
+                closeSessionStatsModal();
+            }
+        }
+
         async function fetchData() {
             try {
                 const response = await fetch('/api/data');
@@ -1728,6 +1946,7 @@ HTML_TEMPLATE = '''
                 pnlEl.className = `metric-value ${data.pnl >= 0 ? 'green' : 'red'}`;
 
                 renderSpyRegime(data.spy_regime, data.spy_regime_error);
+                renderSessionStats(data.session_stats);
 
                 // Update positions
                 const positionsEl = document.getElementById('positions-list');
