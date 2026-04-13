@@ -466,9 +466,10 @@ class TradingBot:
                 'regime': regime.get('regime'),
                 'as_of_date': regime.get('as_of_date'),
                 'predicting_for': regime.get('predicting_for'),
+                'effective_until_utc': regime.get('effective_until_utc'),
             }
             logger.info(
-                "🧭 Active SPY regime: %s | as_of=%s | predicting_for=%s | source=%s | cache=%s",
+                "🧭 Active SPY session bias: %s | generated_from=%s | active_session=%s | source=%s | cache=%s",
                 regime.get('regime', 'unknown'),
                 regime.get('as_of_date', 'unknown'),
                 regime.get('predicting_for', 'unknown'),
@@ -594,6 +595,7 @@ class TradingBot:
             'regime': regime.get('regime'),
             'as_of_date': regime.get('as_of_date'),
             'predicting_for': regime.get('predicting_for'),
+            'effective_until_utc': regime.get('effective_until_utc'),
         }
 
         previous_regime = self.active_spy_regime
@@ -605,7 +607,7 @@ class TradingBot:
             return
 
         logger.info(
-            "🧭 SPY regime updated: %s (%s -> %s) => %s (%s -> %s)",
+            "🧭 SPY session bias updated: %s (%s -> %s) => %s (%s -> %s)",
             previous_regime.get('regime', 'unknown'),
             previous_regime.get('as_of_date', 'unknown'),
             previous_regime.get('predicting_for', 'unknown'),

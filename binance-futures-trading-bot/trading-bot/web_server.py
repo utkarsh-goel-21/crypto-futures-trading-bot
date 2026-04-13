@@ -546,7 +546,7 @@ def monitor_bot_logs():
         append_bot_log_line(f"[ERROR] Failed to read log file: {str(e)}")
 
 def update_spy_regime():
-    """Load the cached SPY regime used by the live bot."""
+    """Load the session-pinned SPY regime used by the live bot."""
     try:
         bot_data['spy_regime'] = spy_regime_filter.get_regime()
         bot_data['spy_regime_error'] = None
@@ -1726,7 +1726,7 @@ HTML_TEMPLATE = '''
             <div class="positions">
                 <div class="section-header">SPY bias</div>
                 <div id="spy-regime-card">
-                    <div class="empty-state loading">Loading daily bias...</div>
+                    <div class="empty-state loading">Loading session bias...</div>
                 </div>
             </div>
 
@@ -1944,6 +1944,7 @@ HTML_TEMPLATE = '''
             const regimeClass = spyRegime.regime === 'LONG_ONLY' ? 'regime-badge regime-long' : 'regime-badge regime-short';
             const regimeLabel = spyRegime.regime === 'LONG_ONLY' ? 'Longs only' : 'Shorts only';
             const missingExternal = (spyRegime.latest_missing_external || []);
+            const effectiveUntil = formatSessionDateTime(spyRegime.effective_until_utc || spyRegime.effective_until_ny);
             const pills = missingExternal.length > 0
                 ? missingExternal.map(item => `<span class="pill pill-warning">${item}</span>`).join('')
                 : '<span class="pill pill-muted">All external features current</span>';
@@ -1957,15 +1958,15 @@ HTML_TEMPLATE = '''
                         <div class="detail-value">${spyRegime.direction || 'Unknown'} • ${(spyRegime.confidence * 100).toFixed(1)}%</div>
                     </div>
                     <div class="regime-copy">
-                        Every new crypto entry must agree with this SPY direction until the next daily refresh.
+                        This SPY direction is pinned for the current US trading session and updates at the next US market open.
                     </div>
                     <div class="detail-grid">
                         <div class="detail-card">
-                            <div class="detail-key">As of</div>
+                            <div class="detail-key">Generated from</div>
                             <div class="detail-value">${spyRegime.as_of_date || 'Unknown'}</div>
                         </div>
                         <div class="detail-card">
-                            <div class="detail-key">Predicting for</div>
+                            <div class="detail-key">Active session</div>
                             <div class="detail-value">${spyRegime.predicting_for || 'Unknown'}</div>
                         </div>
                         <div class="detail-card">
@@ -1973,8 +1974,8 @@ HTML_TEMPLATE = '''
                             <div class="detail-value">${spyRegime.market_data_source || 'Unknown'}</div>
                         </div>
                         <div class="detail-card">
-                            <div class="detail-key">Cache status</div>
-                            <div class="detail-value">${spyRegime.cache_status || 'Unknown'}</div>
+                            <div class="detail-key">Effective until</div>
+                            <div class="detail-value">${effectiveUntil}</div>
                         </div>
                     </div>
                     <div>
