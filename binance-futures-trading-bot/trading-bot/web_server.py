@@ -973,15 +973,61 @@ HTML_TEMPLATE = '''
         }
 
         .position {
+            position: relative;
             display: flex;
             justify-content: space-between;
             align-items: center;
             padding: 16px 0;
             border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            outline: none;
         }
 
         .position:last-child {
             border-bottom: none;
+        }
+
+        .position-tooltip {
+            position: absolute;
+            left: 0;
+            bottom: calc(100% + 10px);
+            display: grid;
+            gap: 6px;
+            min-width: 160px;
+            padding: 12px 14px;
+            border-radius: 16px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            background: rgba(8, 11, 17, 0.96);
+            box-shadow: 0 18px 36px rgba(0, 0, 0, 0.28);
+            opacity: 0;
+            pointer-events: none;
+            transform: translateY(6px);
+            transition: opacity 0.16s ease, transform 0.16s ease;
+            z-index: 20;
+        }
+
+        .position:hover .position-tooltip,
+        .position:focus-visible .position-tooltip {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .position-tooltip-line {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            font-size: 12px;
+            font-variant-numeric: tabular-nums;
+            white-space: nowrap;
+        }
+
+        .position-tooltip-label {
+            color: var(--muted);
+            font-weight: 700;
+        }
+
+        .position-tooltip-value {
+            color: var(--text);
+            font-weight: 800;
         }
 
         .position-info {
@@ -1566,7 +1612,17 @@ HTML_TEMPLATE = '''
                 const positionsEl = document.getElementById('positions-list');
                 if (data.active_trades.length > 0) {
                     positionsEl.innerHTML = data.active_trades.map(pos => `
-                        <div class="position" title="TP: ${formatPriceValue(pos.tp_target)} | SL: ${formatPriceValue(pos.sl_target)}">
+                        <div class="position" tabindex="0" aria-label="TP ${formatPriceValue(pos.tp_target)}, SL ${formatPriceValue(pos.sl_target)}">
+                            <div class="position-tooltip">
+                                <div class="position-tooltip-line">
+                                    <span class="position-tooltip-label">TP</span>
+                                    <span class="position-tooltip-value">${formatPriceValue(pos.tp_target)}</span>
+                                </div>
+                                <div class="position-tooltip-line">
+                                    <span class="position-tooltip-label">SL</span>
+                                    <span class="position-tooltip-value">${formatPriceValue(pos.sl_target)}</span>
+                                </div>
+                            </div>
                             <div class="position-info">
                                 <span class="coin-symbol">${pos.symbol.replace('USDT', '')}</span>
                                 <span class="position-side ${pos.side === 'LONG' ? 'side-long' : 'side-short'}">${pos.side}</span>
