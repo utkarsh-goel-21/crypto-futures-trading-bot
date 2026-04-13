@@ -57,6 +57,7 @@ else:
     SELF_PING_URL = CONFIGURED_SELF_PING_URL or "http://127.0.0.1:5000/health"
 SELF_PING_INTERVAL_SECONDS = 600
 ACCOUNT_REFRESH_SECONDS = 30
+TP_SL_CACHE_REFRESH_SECONDS = 15 * 60
 RATE_LIMIT_BAN_UNTIL_RE = re.compile(r"banned until (\d+)")
 TRADE_EXIT_RE = re.compile(r"Closed:\s+(TP|SL|MANUAL)\s+@")
 
@@ -90,6 +91,7 @@ spy_regime_filter = SpyRegimeFilter(APP_ROOT)
 log_file_offset = 0
 monitor_next_account_refresh_at = 0.0
 monitor_rate_limit_until = 0.0
+monitor_position_targets_cache = {}
 
 
 def is_rate_limit_error(exc):
@@ -169,6 +171,28 @@ def identify_monitor_protective_orders(position_side, open_orders):
             break
 
     return tp_order, sl_order
+
+
+def build_monitor_position_cache_key(position_payload):
+    """Capture the position identity that should invalidate cached TP/SL targets."""
+    return (
+        position_payload.get('side'),
+        round(abs(float(position_payload.get('amount', 0))), 8),
+        round(float(position_payload.get('entry_price', 0)), 8),
+    )
+
+
+def get_cached_monitor_targets(symbol, position_cache_key, now):
+    """Return reusable TP/SL targets when the cached position still matches and is fresh."""
+    cached = monitor_position_targets_cache.get(symbol)
+    if not cached:
+        return None
+    if cached.get('position_key') != position_cache_key:
+        return None
+    fetched_at = float(cached.get('fetched_at') or 0.0)
+    if now - fetched_at >= TP_SL_CACHE_REFRESH_SECONDS:
+        return None
+    return cached
 
 
 def record_trade_exit_from_log(line):
@@ -263,7 +287,7 @@ def stream_bot_output(process):
 
 def refresh_account_snapshot(force=False):
     """Refresh balance and positions with lighter Binance endpoints and rate-limit backoff."""
-    global bot_data, monitor_next_account_refresh_at
+    global bot_data, monitor_next_account_refresh_at, monitor_position_targets_cache
 
     if not client:
         return
@@ -286,6 +310,7 @@ def refresh_account_snapshot(force=False):
                 break
 
         active_positions = []
+        active_symbols = set()
         total_unrealized = 0.0
         for pos in positions:
             amount = float(pos.get('positionAmt', 0))
@@ -302,31 +327,60 @@ def refresh_account_snapshot(force=False):
                 'tp_target': None,
                 'sl_target': None,
             }
+            active_symbols.add(active_position['symbol'])
+            position_cache_key = build_monitor_position_cache_key(active_position)
+            cached_targets = get_cached_monitor_targets(
+                active_position['symbol'],
+                position_cache_key,
+                now,
+            )
 
-            try:
-                conditional_orders = client.futures_get_open_orders(
-                    symbol=pos['symbol'],
-                    conditional=True,
-                )
-                tp_order, sl_order = identify_monitor_protective_orders(
-                    active_position['side'],
-                    conditional_orders,
-                )
-                active_position['tp_target'] = extract_order_trigger_price(tp_order)
-                active_position['sl_target'] = extract_order_trigger_price(sl_order)
-            except Exception as exc:
-                if is_rate_limit_error(exc):
-                    note_monitor_rate_limit(exc, f"conditional snapshot {pos['symbol']}")
-                else:
-                    append_bot_log_line(
-                        f"[WARN] Failed to load TP/SL snapshot for {pos['symbol']}: {exc}"
+            if cached_targets:
+                active_position['tp_target'] = cached_targets.get('tp_target')
+                active_position['sl_target'] = cached_targets.get('sl_target')
+            else:
+                fallback_targets = monitor_position_targets_cache.get(active_position['symbol'])
+                try:
+                    conditional_orders = client.futures_get_open_orders(
+                        symbol=pos['symbol'],
+                        conditional=True,
                     )
+                    tp_order, sl_order = identify_monitor_protective_orders(
+                        active_position['side'],
+                        conditional_orders,
+                    )
+                    active_position['tp_target'] = extract_order_trigger_price(tp_order)
+                    active_position['sl_target'] = extract_order_trigger_price(sl_order)
+                    monitor_position_targets_cache[active_position['symbol']] = {
+                        'position_key': position_cache_key,
+                        'tp_target': active_position['tp_target'],
+                        'sl_target': active_position['sl_target'],
+                        'fetched_at': now,
+                    }
+                except Exception as exc:
+                    if (
+                        fallback_targets
+                        and fallback_targets.get('position_key') == position_cache_key
+                    ):
+                        active_position['tp_target'] = fallback_targets.get('tp_target')
+                        active_position['sl_target'] = fallback_targets.get('sl_target')
+                    if is_rate_limit_error(exc):
+                        note_monitor_rate_limit(exc, f"conditional snapshot {pos['symbol']}")
+                    else:
+                        append_bot_log_line(
+                            f"[WARN] Failed to load TP/SL snapshot for {pos['symbol']}: {exc}"
+                        )
 
             active_positions.append(active_position)
 
         bot_data['balance'] = total_balance
         bot_data['pnl'] = total_unrealized
         bot_data['active_trades'] = active_positions
+        monitor_position_targets_cache = {
+            symbol: cached_targets
+            for symbol, cached_targets in monitor_position_targets_cache.items()
+            if symbol in active_symbols
+        }
         monitor_next_account_refresh_at = now + ACCOUNT_REFRESH_SECONDS
     except Exception as exc:
         if is_rate_limit_error(exc):
