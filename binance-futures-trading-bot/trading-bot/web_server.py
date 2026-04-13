@@ -1413,16 +1413,37 @@ HTML_TEMPLATE = '''
             backdrop-filter: blur(10px);
             z-index: 9999;
             padding: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow-y: auto;
         }
 
         .modal-panel {
+            width: min(100%, 580px);
             max-width: 580px;
-            margin: 64px auto;
             background: linear-gradient(180deg, rgba(18, 22, 28, 0.98), rgba(11, 15, 20, 0.98));
             border: 1px solid var(--border);
             border-radius: 28px;
             padding: 24px;
             box-shadow: var(--shadow);
+            display: flex;
+            flex-direction: column;
+            max-height: min(calc(100dvh - 48px), 760px);
+            overflow: hidden;
+            margin: auto;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+
+        .modal-title-wrap {
+            min-width: 0;
         }
 
         .modal-title {
@@ -1436,7 +1457,57 @@ HTML_TEMPLATE = '''
             font-size: 14px;
             color: var(--muted);
             line-height: 1.6;
-            margin-bottom: 18px;
+            margin-bottom: 0;
+        }
+
+        .modal-close {
+            width: 40px;
+            height: 40px;
+            border-radius: 14px;
+            border: 1px solid var(--border);
+            background: rgba(255, 255, 255, 0.05);
+            color: var(--text);
+            font-size: 22px;
+            line-height: 1;
+            cursor: pointer;
+            flex: 0 0 auto;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            transition: transform 0.18s ease, background 0.18s ease, border-color 0.18s ease;
+        }
+
+        .modal-close:hover {
+            transform: translateY(-1px);
+            background: rgba(255, 255, 255, 0.08);
+            border-color: rgba(255, 255, 255, 0.16);
+        }
+
+        .modal-body {
+            overflow-y: auto;
+            padding-right: 4px;
+        }
+
+        .modal-body::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        .modal-body::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .modal-body::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.12);
+            border-radius: 999px;
+        }
+
+        .modal-footer {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+            margin-top: 18px;
+            padding-top: 16px;
+            border-top: 1px solid rgba(255, 255, 255, 0.06);
         }
 
         .session-stats-grid {
@@ -1550,12 +1621,36 @@ HTML_TEMPLATE = '''
             }
 
             .modal-backdrop {
-                padding: 16px;
+                padding: 12px;
+                align-items: flex-start;
             }
 
             .modal-panel {
-                margin: 24px auto;
-                padding: 18px;
+                width: 100%;
+                max-height: calc(100dvh - 24px);
+                border-radius: 22px;
+                padding: 16px;
+            }
+
+            .modal-header {
+                gap: 12px;
+                margin-bottom: 14px;
+            }
+
+            .modal-title {
+                font-size: 20px;
+            }
+
+            .session-stats-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .modal-footer {
+                justify-content: stretch;
+            }
+
+            .modal-footer .btn {
+                width: 100%;
             }
         }
 
@@ -1646,36 +1741,51 @@ HTML_TEMPLATE = '''
     </div>
     <div id="copy-modal" class="modal-backdrop" style="display:none;">
         <div class="modal-panel">
-            <h3 class="modal-title">Copy Trade Followers</h3>
-            <div class="modal-copy">
-                Add extra Binance Futures testnet accounts and mirror master entries and exits into them.
+            <div class="modal-header">
+                <div class="modal-title-wrap">
+                    <h3 class="modal-title">Copy Trade Followers</h3>
+                    <div class="modal-copy">
+                        Add extra Binance Futures testnet accounts and mirror master entries and exits into them.
+                    </div>
+                </div>
+                <button class="modal-close" type="button" aria-label="Close copy trade followers" onclick="closeCopyModal()">&times;</button>
             </div>
+            <div class="modal-body">
+                <input id="f-label" class="form-input" placeholder="Label (e.g. Friend A)" />
+                <input id="f-api" class="form-input" placeholder="Testnet API Key" />
+                <input id="f-secret" class="form-input" placeholder="Testnet Secret Key" type="password" />
 
-            <input id="f-label" class="form-input" placeholder="Label (e.g. Friend A)" />
-            <input id="f-api" class="form-input" placeholder="Testnet API Key" />
-            <input id="f-secret" class="form-input" placeholder="Testnet Secret Key" type="password" />
+                <div class="modal-actions">
+                    <button class="btn btn-start btn-compact" onclick="addFollower()">Add Follower</button>
+                </div>
 
-            <div class="modal-actions">
-                <button class="btn btn-start btn-compact" onclick="addFollower()">Add Follower</button>
+                <div id="followers-list" class="followers-list"></div>
+            </div>
+            <div class="modal-footer">
                 <button class="btn btn-stop btn-compact" onclick="closeCopyModal()">Close</button>
             </div>
-
-            <div id="followers-list" class="followers-list"></div>
         </div>
     </div>
     <div id="session-stats-modal" class="modal-backdrop" style="display:none;" onclick="handleSessionStatsBackdrop(event)">
         <div class="modal-panel">
-            <h3 class="modal-title">Session Stats</h3>
-            <div class="modal-copy">
-                Session metrics for the current bot runtime. These reset when the bot starts again.
+            <div class="modal-header">
+                <div class="modal-title-wrap">
+                    <h3 class="modal-title">Session Stats</h3>
+                    <div class="modal-copy">
+                        Session metrics for the current bot runtime. These reset when the bot starts again.
+                    </div>
+                </div>
+                <button class="modal-close" type="button" aria-label="Close session stats" onclick="closeSessionStatsModal()">&times;</button>
             </div>
-            <div id="session-stats-content" class="session-stats-grid">
-                <div class="detail-card">
-                    <div class="detail-key">Loading</div>
-                    <div class="detail-value">Fetching session stats...</div>
+            <div class="modal-body">
+                <div id="session-stats-content" class="session-stats-grid">
+                    <div class="detail-card">
+                        <div class="detail-key">Loading</div>
+                        <div class="detail-value">Fetching session stats...</div>
+                    </div>
                 </div>
             </div>
-            <div class="modal-actions">
+            <div class="modal-footer">
                 <button class="btn btn-stop btn-compact" onclick="closeSessionStatsModal()">Close</button>
             </div>
         </div>
