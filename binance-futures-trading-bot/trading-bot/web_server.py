@@ -1006,68 +1006,38 @@ HTML_TEMPLATE = '''
             display: flex;
             justify-content: space-between;
             align-items: center;
-            padding: 16px 12px;
+            padding: 16px 0;
             border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-            border-radius: 18px;
             outline: none;
-            transition: background 0.16s ease;
         }
 
         .position:last-child {
             border-bottom: none;
         }
 
-        .position:hover,
-        .position:focus-visible {
-            background: rgba(255, 255, 255, 0.03);
-        }
-
         .position-tooltip {
             position: absolute;
-            right: 12px;
-            top: calc(100% - 4px);
+            left: 0;
+            bottom: calc(100% + 10px);
             display: grid;
-            gap: 8px;
-            min-width: 188px;
-            padding: 14px 16px;
-            border-radius: 18px;
+            gap: 6px;
+            min-width: 160px;
+            padding: 12px 14px;
+            border-radius: 16px;
             border: 1px solid rgba(255, 255, 255, 0.08);
-            background: linear-gradient(180deg, rgba(21, 28, 39, 0.98), rgba(12, 17, 24, 0.98));
-            box-shadow: 0 22px 44px rgba(0, 0, 0, 0.34);
-            backdrop-filter: blur(14px);
+            background: rgba(8, 11, 17, 0.96);
+            box-shadow: 0 18px 36px rgba(0, 0, 0, 0.28);
             opacity: 0;
             pointer-events: none;
-            transform: translateY(8px) scale(0.98);
-            transform-origin: top right;
+            transform: translateY(6px);
             transition: opacity 0.16s ease, transform 0.16s ease;
-            z-index: 30;
-        }
-
-        .position-tooltip::before {
-            content: "";
-            position: absolute;
-            top: -7px;
-            right: 28px;
-            width: 14px;
-            height: 14px;
-            transform: rotate(45deg);
-            background: rgba(20, 27, 38, 0.98);
-            border-left: 1px solid rgba(255, 255, 255, 0.08);
-            border-top: 1px solid rgba(255, 255, 255, 0.08);
+            z-index: 20;
         }
 
         .position:hover .position-tooltip,
         .position:focus-visible .position-tooltip {
             opacity: 1;
-            transform: translateY(0) scale(1);
-        }
-
-        .position-tooltip-title {
-            font-size: 10px;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-            color: var(--muted);
-            font-weight: 800;
+            transform: translateY(0);
         }
 
         .position-tooltip-line {
@@ -1676,9 +1646,8 @@ HTML_TEMPLATE = '''
                 const positionsEl = document.getElementById('positions-list');
                 if (data.active_trades.length > 0) {
                     positionsEl.innerHTML = data.active_trades.map(pos => `
-                        <div class="position" tabindex="0">
+                        <div class="position" tabindex="0" aria-label="TP ${formatPriceValue(pos.tp_target)}, SL ${formatPriceValue(pos.sl_target)}">
                             <div class="position-tooltip">
-                                <div class="position-tooltip-title">Targets</div>
                                 <div class="position-tooltip-line">
                                     <span class="position-tooltip-label">TP</span>
                                     <span class="position-tooltip-value">${formatPriceValue(pos.tp_target)}</span>
