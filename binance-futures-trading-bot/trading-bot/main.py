@@ -370,6 +370,11 @@ class TradingBot:
         self.ws_manager = None
         self.ws_streams = []
         self.rest_backoff_until = 0.0
+        self.symbol_exchange_rules = {}
+        self.user_order_cache = {}
+        self.user_stream_name = None
+        self.user_stream_started_at = 0.0
+        self.user_stream_last_message_at = 0.0
         
         # OPTIMIZATION ALIGNMENT: Pending signals for delayed execution
         self.pending_signals = {}  # {coin: {'signal': 'LONG/SHORT', 'strength': float, 'filters': dict}}
@@ -383,6 +388,7 @@ class TradingBot:
         
         # Load coin configurations
         self.load_coins()
+        self.load_symbol_exchange_rules()
         
         # Check account
         self.check_account()
@@ -440,6 +446,137 @@ class TradingBot:
     def rest_backoff_active(self):
         """Whether Binance REST calls should currently be skipped."""
         return time.time() < self.rest_backoff_until
+
+    def load_symbol_exchange_rules(self):
+        """Cache Binance symbol filters once so order formatting is exact and REST-light."""
+        try:
+            exchange_info = self.client.futures_exchange_info()
+            rules = {}
+
+            for symbol in exchange_info.get('symbols', []):
+                coin = symbol.get('symbol')
+                if coin not in ACTIVE_COINS:
+                    continue
+
+                filters = {item['filterType']: item for item in symbol.get('filters', [])}
+                lot_filter = filters.get('LOT_SIZE', {})
+                market_lot_filter = filters.get('MARKET_LOT_SIZE', lot_filter)
+                price_filter = filters.get('PRICE_FILTER', {})
+
+                qty_step_str = market_lot_filter.get('stepSize') or lot_filter.get('stepSize') or '1'
+                min_qty_str = market_lot_filter.get('minQty') or lot_filter.get('minQty') or '0'
+                tick_size_str = price_filter.get('tickSize') or '0.01'
+
+                rules[coin] = {
+                    'qty_step_str': qty_step_str,
+                    'qty_step': Decimal(qty_step_str),
+                    'min_qty': Decimal(min_qty_str),
+                    'tick_size_str': tick_size_str,
+                    'tick_size': Decimal(tick_size_str),
+                }
+
+            self.symbol_exchange_rules = rules
+            logger.info(f"✅ Cached exchange rules for {len(rules)} active symbols")
+
+        except Exception as exc:
+            if is_rate_limit_error(exc):
+                self.note_rate_limit("exchange info", exc, fallback_seconds=60)
+            logger.error(f"❌ Failed to cache exchange rules: {exc}")
+
+    def get_symbol_exchange_rules(self, coin):
+        """Return cached exchange rules for a symbol."""
+        rules = self.symbol_exchange_rules.get(coin)
+        if rules is None:
+            self.load_symbol_exchange_rules()
+            rules = self.symbol_exchange_rules.get(coin)
+        return rules
+
+    def floor_to_step(self, value, step):
+        """Floor a Decimal to the nearest valid exchange step."""
+        if step <= 0:
+            return value
+        return (value // step) * step
+
+    def format_exchange_decimal(self, value):
+        """Convert Decimal to a non-scientific string accepted by Binance."""
+        return format(value.normalize(), 'f') if value != 0 else '0'
+
+    def normalize_quantity(self, coin, quantity):
+        """Floor quantity to the exact MARKET_LOT_SIZE / LOT_SIZE step."""
+        rules = self.get_symbol_exchange_rules(coin)
+        if not rules:
+            return None
+
+        quantity_decimal = Decimal(str(quantity))
+        normalized = self.floor_to_step(quantity_decimal, rules['qty_step'])
+        return normalized if normalized > 0 else Decimal('0')
+
+    def format_quantity(self, coin, quantity):
+        """Return an exchange-safe quantity string."""
+        normalized = self.normalize_quantity(coin, quantity)
+        if normalized is None:
+            return None
+        return self.format_exchange_decimal(normalized)
+
+    def normalize_price(self, coin, price):
+        """Floor price to the exact PRICE_FILTER tick size."""
+        rules = self.get_symbol_exchange_rules(coin)
+        if not rules:
+            return Decimal(str(price))
+
+        price_decimal = Decimal(str(price))
+        normalized = self.floor_to_step(price_decimal, rules['tick_size'])
+        return normalized if normalized > 0 else rules['tick_size']
+
+    def format_price_param(self, coin, price):
+        """Return an exchange-safe stop/limit price string."""
+        return self.format_exchange_decimal(self.normalize_price(coin, price))
+
+    def seed_order_cache(self, symbol, order_response):
+        """Prime local order-status cache from create-order responses before websocket confirms them."""
+        order_ref = serialize_order_reference(order_response)
+        if not order_ref:
+            return None
+
+        cache_payload = {
+            'status': order_response.get('status', 'NEW'),
+            'symbol': symbol,
+            'updated_at': time.time(),
+            'source': 'create_order',
+        }
+        self.user_order_cache[order_ref] = cache_payload
+
+        client_order_id = order_response.get('clientOrderId')
+        if client_order_id:
+            self.user_order_cache[f"cid:{client_order_id}"] = cache_payload
+
+        return order_ref
+
+    def get_cached_order_status(self, order_ref):
+        """Return locally cached order status from websocket or create-order responses."""
+        candidates = []
+        if isinstance(order_ref, str):
+            candidates.append(order_ref)
+            if order_ref.isdigit():
+                candidates.append(f"oid:{order_ref}")
+        elif isinstance(order_ref, (int, float)):
+            candidates.append(f"oid:{int(order_ref)}")
+
+        for candidate in candidates:
+            cached = self.user_order_cache.get(candidate)
+            if cached:
+                return cached.get('status')
+        return None
+
+    def user_stream_healthy(self):
+        """Whether the futures user-data stream is recent enough to trust over REST."""
+        if not self.user_stream_name:
+            return False
+
+        now = time.time()
+        if self.user_stream_last_message_at:
+            return (now - self.user_stream_last_message_at) < 3600
+        return (now - self.user_stream_started_at) < 300
 
     def load_initial_candle_buffers(self):
         """Fetch initial history once, then keep the buffers live via WebSocket candle closes."""
@@ -522,15 +659,16 @@ class TradingBot:
             else:
                 logger.warning(f"⚠️ No parameters for {coin}, skipping")
     
-    def check_account(self):
+    def check_account(self, fatal=True):
         """Check account balance and status"""
         try:
-            account = self.client.futures_account()
+            balances = self.client.futures_account_balance()
             
-            # Find USDT balance
-            for asset in account['assets']:
-                if asset['asset'] == 'USDT':
-                    self.account_balance = float(asset['availableBalance'])
+            # Find USDT balance using the lighter balance endpoint.
+            for asset in balances:
+                if asset.get('asset') == 'USDT':
+                    available_balance = asset.get('availableBalance') or asset.get('balance') or asset.get('crossWalletBalance')
+                    self.account_balance = float(available_balance)
                     break
             
             logger.info(f"💰 Account Balance: ${self.account_balance:.2f} USDT")
@@ -538,11 +676,18 @@ class TradingBot:
             
             if self.account_balance < MIN_BALANCE_TO_TRADE:
                 logger.error(f"❌ Insufficient balance! Need ${MIN_BALANCE_TO_TRADE} USDT")
-                sys.exit(1)
+                if fatal:
+                    sys.exit(1)
+                return False
+            return True
                 
         except Exception as e:
+            if is_rate_limit_error(e):
+                self.note_rate_limit("account balance", e, fallback_seconds=60)
             logger.error(f"❌ Failed to check account: {e}")
-            sys.exit(1)
+            if fatal:
+                sys.exit(1)
+            return False
     
     def setup_trading_params(self):
         """Set leverage and margin mode for all coins"""
@@ -566,41 +711,18 @@ class TradingBot:
     def calculate_position_size(self, coin, price):
         """Calculate position size for a coin"""
         try:
-            # Get symbol info
-            exchange_info = self.client.futures_exchange_info()
-            symbol_info = None
-            
-            for symbol in exchange_info['symbols']:
-                if symbol['symbol'] == coin:
-                    symbol_info = symbol
-                    break
-            
-            if not symbol_info:
+            rules = self.get_symbol_exchange_rules(coin)
+            if not rules:
+                return None
+
+            raw_qty = Decimal(str(POSITION_VALUE)) / Decimal(str(price))
+            final_qty = self.normalize_quantity(coin, raw_qty)
+
+            if final_qty is None or final_qty < rules['min_qty']:
+                logger.warning(f"⚠️ {coin} position too small: {final_qty} < {rules['min_qty']}")
                 return None
             
-            # Extract filters
-            step_size = None
-            min_qty = None
-            
-            for filter in symbol_info['filters']:
-                if filter['filterType'] == 'LOT_SIZE':
-                    step_size = float(filter['stepSize'])
-                    min_qty = float(filter['minQty'])
-            
-            # Calculate quantity
-            raw_qty = POSITION_VALUE / price
-            
-            # Round to step size
-            step_decimal = Decimal(str(step_size))
-            qty_decimal = Decimal(str(raw_qty))
-            final_qty = float(qty_decimal.quantize(step_decimal, rounding=ROUND_DOWN))
-            
-            # Check minimum
-            if final_qty < min_qty:
-                logger.warning(f"⚠️ {coin} position too small: {final_qty} < {min_qty}")
-                return None
-            
-            return final_qty
+            return float(final_qty)
             
         except Exception as e:
             logger.error(f"❌ Error calculating position size for {coin}: {e}")
@@ -609,17 +731,7 @@ class TradingBot:
     def format_price(self, coin, price):
         """Format price according to exchange tick size"""
         try:
-            exchange_info = self.client.futures_exchange_info()
-            for symbol in exchange_info['symbols']:
-                if symbol['symbol'] == coin:
-                    for filter in symbol['filters']:
-                        if filter['filterType'] == 'PRICE_FILTER':
-                            tick_size = float(filter['tickSize'])
-                            tick_decimal = Decimal(str(tick_size))
-                            price_decimal = Decimal(str(price))
-                            formatted_price = float(price_decimal.quantize(tick_decimal, rounding=ROUND_DOWN))
-                            return formatted_price
-            return price
+            return float(self.normalize_price(coin, price))
         except:
             return price
 
@@ -728,13 +840,17 @@ class TradingBot:
             if not PAPER_TRADING:
                 # Place market order to close position
                 quantity = position['quantity']
+                formatted_quantity = self.format_quantity(coin, quantity)
+                if not formatted_quantity:
+                    logger.error(f"❌ Failed to format close quantity for {coin}: {quantity}")
+                    return False
                 if position['side'] == 'LONG':
                     # Close LONG by selling
                     self.client.futures_create_order(
                         symbol=coin,
                         side='SELL',
                         type='MARKET',
-                        quantity=quantity
+                        quantity=formatted_quantity
                     )
                 else:
                     # Close SHORT by buying
@@ -742,7 +858,7 @@ class TradingBot:
                         symbol=coin,
                         side='BUY',
                         type='MARKET',
-                        quantity=quantity
+                        quantity=formatted_quantity
                     )
             
             # Handle exit accounting
@@ -766,24 +882,29 @@ class TradingBot:
                 tp_order_ref = f"paper:tp:{time.time()}"
                 sl_order_ref = f"paper:sl:{time.time()}"
             else:
+                formatted_quantity = self.format_quantity(coin, quantity)
+                if not formatted_quantity:
+                    logger.error(f"❌ Invalid formatted quantity for {coin}: {quantity}")
+                    return None, None, None
+
                 # Place real entry order
                 if side == 'BUY':
                     entry_order = self.client.futures_create_order(
                         symbol=coin,
                         side='BUY',
                         type='MARKET',
-                        quantity=quantity
+                        quantity=formatted_quantity
                     )
                 else:
                     entry_order = self.client.futures_create_order(
                         symbol=coin,
                         side='SELL',
                         type='MARKET',
-                        quantity=quantity
+                        quantity=formatted_quantity
                     )
                 
                 logger.info(f"✅ Entry order placed: {side} {quantity} {coin}")
-                entry_order_ref = serialize_order_reference(entry_order)
+                entry_order_ref = self.seed_order_cache(coin, entry_order)
                 if not entry_order_ref:
                     logger.error(f"❌ Entry order response missing identifiers for {coin}: {entry_order}")
                     return None, None, None
@@ -801,6 +922,8 @@ class TradingBot:
                 # Format prices according to tick size
                 tp_price = self.format_price(coin, tp_price)
                 sl_price = self.format_price(coin, sl_price)
+                tp_price_param = self.format_price_param(coin, tp_price)
+                sl_price_param = self.format_price_param(coin, sl_price)
                 
                 logger.info(f"📊 Setting TP @ ${tp_price:.2f} (+{params['tp_percent']*100:.2f}%)")
                 logger.info(f"📊 Setting SL @ ${sl_price:.2f} (-{params['sl_percent']*100:.2f}%)")
@@ -811,12 +934,12 @@ class TradingBot:
                         symbol=coin,
                         side=exit_side,
                         type='TAKE_PROFIT_MARKET',
-                        stopPrice=tp_price,
-                        quantity=quantity,
+                        stopPrice=tp_price_param,
+                        quantity=formatted_quantity,
                         reduceOnly=True,
                         workingType='MARK_PRICE'
                     )
-                    tp_order_ref = serialize_order_reference(tp_order)
+                    tp_order_ref = self.seed_order_cache(coin, tp_order)
                     if tp_order_ref:
                         logger.info(f"✅ TP order placed: {format_order_reference(tp_order_ref)}")
                     else:
@@ -831,12 +954,12 @@ class TradingBot:
                         symbol=coin,
                         side=exit_side,
                         type='STOP_MARKET',
-                        stopPrice=sl_price,
-                        quantity=quantity,
+                        stopPrice=sl_price_param,
+                        quantity=formatted_quantity,
                         reduceOnly=True,
                         workingType='MARK_PRICE'
                     )
-                    sl_order_ref = serialize_order_reference(sl_order)
+                    sl_order_ref = self.seed_order_cache(coin, sl_order)
                     if sl_order_ref:
                         logger.info(f"✅ SL order placed: {format_order_reference(sl_order_ref)}")
                     else:
@@ -887,6 +1010,13 @@ class TradingBot:
         lookup_params = self.resolve_order_lookup_params(coin, order_id)
         if not lookup_params:
             return 'MISSING'
+
+        cached_status = self.get_cached_order_status(order_id)
+        if cached_status:
+            return cached_status
+
+        if conditional and self.user_stream_healthy():
+            return 'PENDING_WS'
 
         if self.rest_backoff_active():
             return 'RATE_LIMITED'
@@ -1019,11 +1149,15 @@ class TradingBot:
                     if not PAPER_TRADING and (not tp_order_ref or not sl_order_ref):
                         logger.error(f"❌ {coin} entry is missing TP/SL protection. Closing the position immediately.")
                         try:
+                            formatted_quantity = self.format_quantity(coin, quantity)
+                            if not formatted_quantity:
+                                logger.error(f"❌ Invalid formatted protection-close quantity for {coin}: {quantity}")
+                                return
                             self.client.futures_create_order(
                                 symbol=coin,
                                 side='SELL' if signal == 'LONG' else 'BUY',
                                 type='MARKET',
-                                quantity=quantity,
+                                quantity=formatted_quantity,
                                 reduceOnly=True
                             )
                             logger.info(f"✅ Closed unprotected {coin} entry immediately")
@@ -1123,10 +1257,16 @@ class TradingBot:
             if tp_status == 'RATE_LIMITED' or sl_status == 'RATE_LIMITED':
                 return None
 
+            if tp_status == 'PENDING_WS' or sl_status == 'PENDING_WS':
+                return None
+
             if tp_status in missing_statuses and sl_status in missing_statuses and not PAPER_TRADING:
+                if self.user_stream_healthy():
+                    return None
+
                 # On testnet, give orders more time to appear (testnet is slower)
                 position_age = (datetime.now() - position.get('entry_time', datetime.now())).total_seconds()
-                if position_age < 30:  # Wait 30 seconds before panicking on testnet
+                if position_age < 90:  # Give exchange-side TP/SL and websocket reconciliation time before panicking.
                     return None  # Don't close yet, orders might still be syncing
                 
                 try:
@@ -1135,23 +1275,27 @@ class TradingBot:
                     current_price = float(ticker['price'])
                     
                     # Only proceed if we successfully got price
-                    logger.warning(f"⚠️ Both orders missing for {coin} after 30s! Closing position manually")
+                    logger.warning(f"⚠️ Both orders missing for {coin} after 90s with no private-stream confirmation! Closing position manually")
                     
                     # Place market order to close
                     quantity = position['quantity']
+                    formatted_quantity = self.format_quantity(coin, quantity)
+                    if not formatted_quantity:
+                        logger.error(f"❌ Invalid formatted manual-close quantity for {coin}: {quantity}")
+                        return None
                     if position['side'] == 'LONG':
                         self.client.futures_create_order(
                             symbol=coin,
                             side='SELL',
                             type='MARKET',
-                            quantity=quantity
+                            quantity=formatted_quantity
                         )
                     else:
                         self.client.futures_create_order(
                             symbol=coin,
                             side='BUY',
                             type='MARKET',
-                            quantity=quantity
+                            quantity=formatted_quantity
                         )
                     
                     self.handle_exit(coin, 'MANUAL', current_price)
@@ -1233,7 +1377,7 @@ class TradingBot:
             self.position_tracker.remove_position(coin)
             
             # Update balance
-            self.check_account()
+            self.check_account(fatal=False)
             
         except Exception as e:
             logger.error(f"Error handling exit for {coin}: {e}")
@@ -1258,6 +1402,12 @@ class TradingBot:
             testnet=USE_TESTNET,
         )
         self.ws_manager.start()
+        self.user_stream_started_at = time.time()
+        self.user_stream_name = self.ws_manager.start_futures_user_socket(
+            callback=self.handle_user_stream_message
+        )
+        self.ws_streams.append(self.user_stream_name)
+        logger.info("✅ Futures user-data stream active for order/account reconciliation")
 
         started = set()
         for coin, manager in self.coin_managers.items():
@@ -1274,6 +1424,59 @@ class TradingBot:
                 started.add(stream_key)
 
         logger.info("✅ WebSocket market streams active for %s symbol/timeframe pairs", len(started))
+
+    def handle_user_stream_message(self, msg):
+        """Track order/account updates from the futures private stream before falling back to REST."""
+        try:
+            if not isinstance(msg, dict):
+                return
+
+            if msg.get('e') == 'error':
+                logger.error(f"User WebSocket error: {msg.get('type')} - {msg.get('m')}")
+                return
+
+            self.user_stream_last_message_at = time.time()
+            event_type = msg.get('e')
+
+            if event_type == 'ORDER_TRADE_UPDATE':
+                order = msg.get('o', {})
+                symbol = order.get('s')
+                order_status = order.get('X') or order.get('x') or 'UNKNOWN'
+                order_id = order.get('i')
+                client_order_id = order.get('c')
+
+                cache_payload = {
+                    'status': order_status,
+                    'symbol': symbol,
+                    'updated_at': self.user_stream_last_message_at,
+                    'source': 'user_stream',
+                    'execution_type': order.get('x'),
+                }
+
+                references = []
+                if order_id not in (None, ''):
+                    references.append(f"oid:{order_id}")
+                if client_order_id:
+                    references.append(f"cid:{client_order_id}")
+
+                for reference in references:
+                    self.user_order_cache[reference] = cache_payload
+
+                if order_status in {'FILLED', 'CANCELED', 'EXPIRED', 'REJECTED'}:
+                    display_ref = references[0] if references else order_id
+                    logger.info(f"📨 {symbol} order update {format_order_reference(display_ref)}: {order_status}")
+
+            elif event_type == 'ACCOUNT_UPDATE':
+                account = msg.get('a', {})
+                for balance in account.get('B', []):
+                    if balance.get('a') == 'USDT':
+                        wallet_balance = balance.get('wb') or balance.get('cw')
+                        if wallet_balance is not None:
+                            self.account_balance = float(wallet_balance)
+                        break
+
+        except Exception as exc:
+            logger.error(f"Error handling user stream message: {exc}")
 
     def handle_kline_message(self, msg):
         """Handle futures kline messages from WebSocket streams."""
