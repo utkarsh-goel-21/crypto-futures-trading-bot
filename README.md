@@ -1,6 +1,10 @@
-# Crypto Futures Bot with SPY Regime Filter
+# Crypto Futures Bot with SPY Session Bias Filter
 
-A Binance Futures trading system that combines a multi-indicator crypto strategy with a daily SPY LSTM bias filter from the sibling `spy-predictor` project. It includes an optimizer, a live trading bot, a web monitor, and optional copy-trade follower support.
+A Binance Futures trading system that combines a multi-indicator crypto strategy with a session-pinned SPY LSTM bias filter from the sibling `spy-predictor-remote` project. It includes an optimizer, a live trading bot, a web monitor, and optional copy-trade follower support.
+
+Live monitor:
+
+- https://trading-bot-3mbl.onrender.com/
 
 ---
 
@@ -16,7 +20,7 @@ Run the live bot across 9 USDT perpetual pairs while enforcing a daily macro gat
 The live system combines:
 1. **Coin-specific multi-indicator logic** optimized from historical crypto data
 2. **1-candle delayed execution** aligned with the live bot's intended backtest behavior
-3. **Daily SPY LSTM regime filter** fetched from the sibling `spy-predictor` project
+3. **Session-pinned SPY LSTM bias filter** fetched from the sibling `spy-predictor-remote` project
 4. **Binance Futures execution** with market entries and exchange-side TP/SL orders
 5. **Flask monitor UI** for balances, positions, logs, and SPY regime state
 
@@ -46,7 +50,7 @@ User opens monitor UI
              |
              v
    +-------------------+
-   | SPY Daily Gate    |  <- spy_integration.py -> sibling spy-predictor
+   | SPY Session Gate  |  <- spy_integration.py -> sibling spy-predictor-remote
    +---------+---------+
              |
              v
@@ -69,7 +73,7 @@ User opens monitor UI
 | LONG | `SHORT_ONLY` | Blocked |
 | SHORT | `LONG_ONLY` | Blocked |
 
-The SPY regime is cached for 24 hours and reused across the trading day.
+The SPY session bias is cached and reused across the active US trading session.
 
 ---
 
@@ -84,7 +88,7 @@ The SPY regime is cached for 24 hours and reused across the trading day.
 | **Monitor UI** | Flask, Flask-CORS, inline HTML/CSS/JS |
 | **Persistence** | SQLite, rotating log files |
 | **Notifications** | Telegram, Discord webhook |
-| **Macro Filter** | Sibling `spy-predictor` LSTM via `spy_integration.py` |
+| **Macro Filter** | Sibling `spy-predictor-remote` LSTM via `spy_integration.py` |
 
 ---
 
@@ -150,7 +154,7 @@ Recommended layout:
 ```text
 parent-folder/
 ├── crypto-futures-trading-bot/
-└── spy-predictor/
+└── spy-predictor-remote/
 ```
 
 ---
