@@ -107,6 +107,7 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 RATE_LIMIT_BAN_UNTIL_RE = re.compile(r"banned until (\d+)")
+SPY_BIAS_CLOSE_RECHECK_SECONDS = 30
 
 
 def is_rate_limit_error(exc):
@@ -438,6 +439,7 @@ class TradingBot:
         self.pending_signals = {}  # {coin: {'signal': 'LONG/SHORT', 'strength': float, 'filters': dict}}
         self.spy_regime_filter = SpyRegimeFilter(PROJECT_ROOT)
         self.active_spy_regime = None
+        self.pending_spy_bias_close = None
 
         stats_tracker.update_position_tracker(self.position_tracker)
 
@@ -543,6 +545,83 @@ class TradingBot:
                     snapshot['pnl_value'],
                 )
 
+        self.pending_spy_bias_close = None
+
+    def schedule_pending_spy_bias_close(self, previous_regime, current_regime, trigger_label):
+        """Keep checking a conflicting basket after a SPY bias flip until it can be closed profitably."""
+        pending = self.pending_spy_bias_close
+        if (
+            pending
+            and pending.get('previous_regime') == previous_regime
+            and pending.get('current_regime') == current_regime
+        ):
+            return
+
+        self.pending_spy_bias_close = {
+            'previous_regime': previous_regime,
+            'current_regime': current_regime,
+            'trigger_label': trigger_label,
+            'next_check_at': time.time() + SPY_BIAS_CLOSE_RECHECK_SECONDS,
+        }
+        logger.info(
+            "🧭 %s: basket unrealized PnL is not positive yet. Will recheck every %ss until positions can be closed profitably.",
+            trigger_label,
+            SPY_BIAS_CLOSE_RECHECK_SECONDS,
+        )
+
+    def clear_pending_spy_bias_close(self, reason):
+        """Drop a pending SPY-bias close watch when it no longer applies."""
+        if self.pending_spy_bias_close:
+            logger.info("🧭 Pending SPY bias close cleared: %s", reason)
+        self.pending_spy_bias_close = None
+
+    def maybe_handle_pending_spy_bias_close(self):
+        """Re-evaluate a conflicting basket after a SPY bias flip until it turns profitable."""
+        pending = self.pending_spy_bias_close
+        if not pending:
+            return
+
+        if time.time() < pending.get('next_check_at', 0):
+            return
+
+        pending['next_check_at'] = time.time() + SPY_BIAS_CLOSE_RECHECK_SECONDS
+        current_regime = self.active_spy_regime or pending.get('current_regime') or {}
+
+        active_positions = self.position_tracker.get_all_positions()
+        if not active_positions:
+            self.clear_pending_spy_bias_close("no active positions remain")
+            return
+
+        conflicting_positions = [
+            coin for coin, position in active_positions.items()
+            if self.position_conflicts_with_regime(position['side'], current_regime.get('regime'))
+        ]
+        if not conflicting_positions:
+            self.clear_pending_spy_bias_close("active positions align with the current SPY regime")
+            return
+
+        try:
+            basket_snapshots, basket_pnl_value = self.collect_active_basket_snapshots(active_positions)
+        except Exception as exc:
+            logger.error(f"❌ Failed to evaluate pending SPY bias close: {exc}")
+            return
+
+        logger.info(
+            "🧭 Pending SPY bias close recheck: regime=%s | conflicting positions=%s | active basket unrealized PnL=$%.2f",
+            current_regime.get('regime', 'unknown'),
+            ", ".join(conflicting_positions),
+            basket_pnl_value,
+        )
+
+        if basket_pnl_value <= 0:
+            return
+
+        self.close_active_basket_for_spy_bias(
+            basket_snapshots,
+            basket_pnl_value,
+            pending.get('trigger_label', 'Pending SPY bias close triggered'),
+        )
+
     def maybe_handle_startup_spy_bias_alignment(self):
         """Run a one-time startup alignment check for restored positions against the active SPY regime."""
         regime = self.active_spy_regime
@@ -574,7 +653,11 @@ class TradingBot:
         )
 
         if basket_pnl_value <= 0:
-            logger.info("🧭 Startup SPY alignment close skipped because active basket unrealized PnL is not positive")
+            self.schedule_pending_spy_bias_close(
+                None,
+                regime,
+                "Startup SPY bias alignment triggered",
+            )
             return
 
         self.close_active_basket_for_spy_bias(
@@ -624,13 +707,16 @@ class TradingBot:
         active_positions = self.position_tracker.get_all_positions()
         if not active_positions:
             logger.info("🧭 SPY bias changed but there are no active positions to review")
+            self.clear_pending_spy_bias_close("no active positions after SPY bias change")
             return
 
-        for coin, position in active_positions.items():
-            if self.position_conflicts_with_regime(position['side'], current_regime.get('regime')):
-                break
-        else:
+        conflicting_positions = [
+            coin for coin, position in active_positions.items()
+            if self.position_conflicts_with_regime(position['side'], current_regime.get('regime'))
+        ]
+        if not conflicting_positions:
             logger.info("🧭 SPY bias changed but active positions already align with the new regime")
+            self.clear_pending_spy_bias_close("active positions align with the new SPY regime")
             return
 
         try:
@@ -648,7 +734,11 @@ class TradingBot:
         )
 
         if basket_pnl_value <= 0:
-            logger.info("🧭 Bias-change close skipped because active basket unrealized PnL is not positive")
+            self.schedule_pending_spy_bias_close(
+                previous_regime,
+                current_regime,
+                "Bias-change close triggered",
+            )
             return
 
         self.close_active_basket_for_spy_bias(
@@ -1244,17 +1334,22 @@ class TradingBot:
         if not order_ref or not order_payload:
             return False
 
+        order_id = order_payload.get('orderId', order_payload.get('i'))
+        algo_id = order_payload.get('algoId', order_payload.get('ai'))
+        client_order_id = order_payload.get('clientOrderId', order_payload.get('c'))
+        client_algo_id = order_payload.get('clientAlgoId', order_payload.get('ci'))
+
         if isinstance(order_ref, str):
             if order_ref.startswith('oid:'):
-                return str(order_payload.get('orderId')) == order_ref.split(':', 1)[1]
+                return str(order_id) == order_ref.split(':', 1)[1]
             if order_ref.startswith('aid:'):
-                return str(order_payload.get('algoId')) == order_ref.split(':', 1)[1]
+                return str(algo_id) == order_ref.split(':', 1)[1]
             if order_ref.startswith('cid:'):
-                return str(order_payload.get('clientOrderId')) == order_ref.split(':', 1)[1]
+                return str(client_order_id) == order_ref.split(':', 1)[1]
             if order_ref.startswith('caid:'):
-                return str(order_payload.get('clientAlgoId')) == order_ref.split(':', 1)[1]
+                return str(client_algo_id) == order_ref.split(':', 1)[1]
             if order_ref.isdigit():
-                return str(order_payload.get('orderId')) == order_ref
+                return str(order_id) == order_ref
 
         return False
 
@@ -1878,7 +1973,14 @@ class TradingBot:
             ):
                 return False
 
-            if order_type.startswith('TAKE_PROFIT') or original_type.startswith('TAKE_PROFIT'):
+            tp_order_ref = position.get('tp_order_id')
+            sl_order_ref = position.get('sl_order_id')
+
+            if tp_order_ref and self.order_matches_reference(tp_order_ref, order):
+                exit_type = 'TP'
+            elif sl_order_ref and self.order_matches_reference(sl_order_ref, order):
+                exit_type = 'SL'
+            elif order_type.startswith('TAKE_PROFIT') or original_type.startswith('TAKE_PROFIT'):
                 exit_type = 'TP'
             elif order_type.startswith('STOP') or original_type.startswith('STOP'):
                 exit_type = 'SL'
@@ -2099,6 +2201,7 @@ class TradingBot:
                     #         discord.send_message(summary)
 
                 self.maybe_handle_spy_bias_change()
+                self.maybe_handle_pending_spy_bias_close()
                 
                 # Check each coin for order fills
                 for coin in ACTIVE_COINS:
