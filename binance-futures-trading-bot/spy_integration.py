@@ -35,13 +35,23 @@ class SpyRegimeFilter:
     def _find_spy_project_root(self) -> Path:
         candidates = []
         for parent in [self.project_root, *self.project_root.parents]:
+            candidates.append(parent / "spy-predictor-remote")
             candidates.append(parent / "spy-predictor")
 
         for candidate in candidates:
-            if (candidate / "backend" / "api" / "predict.py").exists():
+            api_main = candidate / "backend" / "api" / "main.py"
+            if not api_main.exists():
+                continue
+            try:
+                api_main_text = api_main.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if "build_active_session_regime_payload" in api_main_text:
                 return candidate
 
-        raise FileNotFoundError("Could not locate sibling spy-predictor project.")
+        raise FileNotFoundError(
+            "Could not locate sibling spy-predictor project with session-regime support."
+        )
 
     def _get_spy_python(self, spy_root: Path) -> str:
         candidates = [

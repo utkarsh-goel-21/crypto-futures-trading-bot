@@ -20,6 +20,7 @@ secrets.py
 # Database and Logs
 *.db
 *.log
+*.log.*
 logs/
 spy_regime_cache.json
 followers.json

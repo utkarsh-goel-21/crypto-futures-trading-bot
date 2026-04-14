@@ -1,6 +1,10 @@
-# Crypto Futures Bot with SPY Regime Filter
+# Crypto Futures Bot with SPY Session Bias Filter
 
-This is the canonical live bot folder. It runs a multi-coin Binance Futures strategy, gates entries with a daily SPY regime from `spy-predictor`, and exposes a Flask monitor for status, logs, positions, and copy-trade controls.
+This is the canonical live bot folder. It runs a multi-coin Binance Futures strategy, gates entries with a session-pinned SPY bias from `spy-predictor-remote`, and exposes a Flask monitor for status, logs, positions, and copy-trade controls.
+
+Live monitor:
+
+- https://trading-bot-3mbl.onrender.com/
 
 ---
 
@@ -10,7 +14,7 @@ The live system combines:
 
 1. Optimized per-coin crypto entries from `trading-bot/parameters/*.json`
 2. 1-candle delayed execution so live behavior matches the intended backtest flow
-3. Daily SPY `LONG_ONLY` / `SHORT_ONLY` gating from `spy_integration.py`
+3. Session-pinned SPY `LONG_ONLY` / `SHORT_ONLY` gating from `spy_integration.py`
 4. Binance Futures market entries with exchange-side TP/SL conditional orders
 5. A Flask monitor for balances, open positions, logs, and follower management
 
@@ -34,7 +38,7 @@ Monitor UI (/)
       |      Used for order/account reconciliation before REST fallback
       |
       +--> spy_integration.py
-             Daily SPY regime cache from deployed SPY API or local sibling project
+             Session-pinned SPY bias from deployed SPY API or local sibling project
 ```
 
 ### Execution Model
@@ -67,7 +71,7 @@ Monitor UI (/)
 | Monitor UI | Flask, Flask-CORS |
 | Persistence | SQLite + rotating logs locally, in-memory only on Render by default |
 | Notifications | Telegram notifier hooks |
-| Macro Filter | `spy_integration.py` with SPY predictor API or local sibling fallback |
+| Macro Filter | `spy_integration.py` with session-pinned SPY predictor API or local sibling fallback |
 
 ---
 
@@ -108,14 +112,14 @@ binance-futures-trading-bot/
 - Binance Futures Testnet account
 - Either:
   - the deployed SPY API URL, or
-  - a discoverable sibling `spy-predictor` checkout
+  - a discoverable sibling `spy-predictor-remote` checkout
 
 Recommended local layout if you want sibling-project fallback:
 
 ```text
 parent-folder/
 ├── crypto-futures-trading-bot/
-└── spy-predictor/
+└── spy-predictor-remote/
 ```
 
 ### 1. Install dependencies
@@ -148,7 +152,7 @@ Notes:
 
 - `USE_TESTNET=true` is the safe default.
 - If env vars are not set, the code falls back to local files such as `trading-bot/apikey_testnet.py`.
-- If `SPY_PREDICTOR_API_URL` is not set, `spy_integration.py` falls back to a local sibling `spy-predictor` project.
+- If `SPY_PREDICTOR_API_URL` is not set, `spy_integration.py` falls back to a local sibling SPY predictor project and prefers `spy-predictor-remote` when available.
 
 ### 3. Verify Binance connectivity
 
@@ -242,17 +246,18 @@ Removes a follower.
 
 ## SPY Integration
 
-`spy_integration.py` caches the SPY regime for 24 hours.
+`spy_integration.py` caches the active SPY session bias and fetches it from the SPY backend `/session-regime` endpoint.
 
 Current behavior:
 
-- first request fetches the regime from `SPY_PREDICTOR_API_URL` if configured
-- otherwise it falls back to the local sibling `spy-predictor`
+- first request fetches the active session bias from `SPY_PREDICTOR_API_URL` if configured
+- otherwise it falls back to the local sibling SPY project
 - the result is cached in memory
 - outside Render, it can also persist to `spy_regime_cache.json`
 - on refresh failure, stale cache is reused if available
+- the returned SPY bias is pinned to the current US trading session and changes at the next US market open, not immediately after the latest `/predict` response changes
 
-That means the crypto bot does not hit the SPY predictor on every coin signal.
+That means the crypto bot does not hit the SPY predictor on every coin signal, and restarts do not prematurely switch to the next session's SPY bias.
 
 ---
 
@@ -272,6 +277,7 @@ Recent live/runtime improvements:
 - futures private user stream is used for order/account reconciliation before REST fallback
 - symbol `LOT_SIZE`, `MARKET_LOT_SIZE`, and `PRICE_FILTER` are cached once and used for precise order formatting
 - REST backoff is applied when Binance returns `-1003`
+- the monitor can fall back to log-derived open positions and unrealized PnL while Binance REST snapshots are temporarily rate-limited
 
 ---
 
