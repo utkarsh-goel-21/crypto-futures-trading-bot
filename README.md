@@ -6,6 +6,10 @@ Live monitor:
 
 - https://trading-bot-3mbl.onrender.com/
 
+Project presentation:
+
+- https://docs.google.com/presentation/d/1hek5fDBWCMEg4ZhHSKIu8EP90_qPlgta/edit?usp=drivesdk&ouid=104891935307924335509&rtpof=true&sd=true
+
 ---
 
 ## What It Does
